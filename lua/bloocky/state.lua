@@ -88,6 +88,10 @@ function M.add_block(fields)
 		notes = fields.notes or "",
 		recurrence = fields.recurrence, -- nil | { type, days?, until_date?, exdates? }
 		all_day = fields.all_day or nil, -- true for a date-based block; absent means timed
+		attendees = fields.attendees, -- nil | { { name, email, partstat, role } }
+		organizer = fields.organizer, -- nil | { name, email }
+		location = fields.location, -- nil | string
+		teams = fields.teams or nil, -- nil | boolean (online Teams meeting)
 		created_at = os.time(),
 		updated_at = os.time(), -- bumped on every edit; sync reads it
 		source = fields.source or "local", -- "local" or the sync account it came from
@@ -110,6 +114,20 @@ function M.update_block(id, fields)
 			block.notes = fields.notes or ""
 			block.recurrence = fields.recurrence
 			block.all_day = fields.all_day or nil
+			-- attendees/organizer/location are server-owned; keep them unless
+			-- the caller explicitly provides them (sync does)
+			if fields.attendees ~= nil then
+				block.attendees = fields.attendees
+			end
+			if fields.organizer ~= nil then
+				block.organizer = fields.organizer
+			end
+			if fields.location ~= nil then
+				block.location = fields.location
+			end
+			if fields.teams ~= nil then
+				block.teams = fields.teams
+			end
 			block.updated_at = os.time()
 			block.source = block.source or "local" -- backfill for pre-sync blocks
 			M.save_blocks()

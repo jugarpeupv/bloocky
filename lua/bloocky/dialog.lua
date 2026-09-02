@@ -15,6 +15,7 @@ local LAYOUT = {
 	{ "Days", "left" },
 	{ "Until", "right" },
 	{ "Notes", "full" },
+	{ "Attendees", "full" },
 }
 
 -- Shown inside an input while it is empty
@@ -27,6 +28,7 @@ local HINTS = {
 	Days = "mon,wed,fri",
 	Until = "empty = forever",
 	Notes = "optional",
+	Attendees = "name <email>, name2 <email2>",
 }
 
 -- Extmark ids inside each input buffer
@@ -73,17 +75,35 @@ local function initial_values(opts)
 				table.insert(day_names, rev[d])
 			end
 		end
-		return {
-			Title = block.title,
-			Date = block.date,
-			Start = utils.format_hhmm(block.start_min),
-			Duration = utils.format_duration(block.duration_min),
-			Repeat = r and r.type or "none",
-			Days = table.concat(day_names, ","),
-			Until = (r and r.until_date) or "",
-			Notes = (block.notes or ""):gsub("\n", " "),
-		}
+	return {
+		Title = block.title,
+		Date = block.date,
+		Start = utils.format_hhmm(block.start_min),
+		Duration = utils.format_duration(block.duration_min),
+		Repeat = r and r.type or "none",
+		Days = table.concat(day_names, ","),
+		Until = (r and r.until_date) or "",
+		Notes = (block.notes or ""):gsub("\n", " "),
+		Attendees = block.attendees and format_attendees(block.attendees) or "",
+	}
+end
+
+local function format_attendees(attendees)
+	if type(attendees) ~= "table" or #attendees == 0 then
+		return ""
 	end
+	local parts = {}
+	for _, a in ipairs(attendees) do
+		if a.name and a.email then
+			table.insert(parts, a.name .. " <" .. a.email .. ">")
+		elseif a.email ~= "" then
+			table.insert(parts, a.email)
+		else
+			table.insert(parts, a.name or "")
+		end
+	end
+	return table.concat(parts, ", ")
+end
 	local prefill = opts.prefill or {}
 	return {
 		Title = "",
@@ -95,6 +115,44 @@ local function initial_values(opts)
 		Until = "",
 		Notes = "",
 	}
+end
+
+-- Parse "Alice <alice@b.com>, Bob <bob@b.com>" into { {name, email} }
+local function parse_attendees(raw)
+	local out = {}
+	if not raw or raw == "" then
+		return nil
+	end
+	local str = raw
+	while true do
+		local token = str:match("^%s*([^,]*),")
+		if not token then
+			token = str:match("^%s*(.+)")
+			if not token or token:match("^%s*$") then
+				break
+			end
+			token = token:gsub("^%s*(.-)%s*$", "%1")
+			str = ""
+		else
+			str = str:sub(#token + 2)
+			token = token:gsub("^%s*(.-)%s*$", "%1")
+		end
+		-- token may be "Name <email>" or just "email" or "Name"
+		local name, email = token:match("^(.-)%s*<([^>]+)>%s*$")
+		if name and email then
+			name = name:gsub("^%s*(.-)%s*$", "%1")
+			email = email:gsub("^%s*(.-)%s*$", "%1")
+			table.insert(out, { name = name ~= "" and name or email, email = email })
+		elseif token:match("@") then
+			table.insert(out, { name = token, email = token })
+		elseif token ~= "" then
+			table.insert(out, { name = token, email = "" })
+		end
+		if str == "" then
+			break
+		end
+	end
+	return #out > 0 and out or nil
 end
 
 -- Validate raw field values (lowercase keys) into block fields.
@@ -159,13 +217,21 @@ local function validate(raw)
 		return nil, errs
 	end
 
-	local granularity = config.options.granularity or 30
-	start_min = utils.snap(start_min, granularity)
-	duration = math.max(granularity, utils.snap(duration, granularity))
+	duration = math.max(1, duration)
 
 	local recurrence = nil
 	if rtype ~= "none" then
 		recurrence = { type = rtype, days = days, until_date = until_date }
+	end
+
+	local teams = nil
+	if raw.teams ~= nil then
+		local t = vim.trim(tostring(raw.teams)):lower()
+		if t == "yes" or t == "true" or t == "1" or t == "si" or t == "sí" or t == "teams" or t == "y" or t == "s" then
+			teams = true
+		elseif t == "no" or t == "false" or t == "0" or t == "n" then
+			teams = false
+		end
 	end
 
 	return {
@@ -175,17 +241,25 @@ local function validate(raw)
 		duration_min = duration,
 		notes = vim.trim(raw.notes or ""),
 		recurrence = recurrence,
+		attendees = parse_attendees(raw.attendees or ""),
+		teams = teams,
 	}
 end
 
 -- Expose for reuse/testing
 M.validate = validate
+M.parse_attendees = parse_attendees
 
 -- Open the block dialog: a container window with one small input window
 -- per field, navigated with Tab / Enter.
 -- opts: { block = existing_block?, prefill = { date, start_min }?, on_save = fn(fields) }
 -- Returns a handle { container, inputs } (used by tests).
 function M.open(opts)
+	opts = opts or {}
+	local dmode = opts.mode or (config.options.dialog and config.options.dialog.mode) or "vsplit"
+	if dmode == "vsplit" or dmode == "split" or dmode == "buffer" then
+		return require("bloocky.form").open(opts)
+	end
 	local values = initial_values(opts)
 	local items, height = layout()
 	local aug = vim.api.nvim_create_augroup("bloocky_dialog", { clear = true })

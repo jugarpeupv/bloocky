@@ -31,6 +31,73 @@ local function single_line(text)
 	return (text:gsub("%s*[\r\n]+%s*", " "))
 end
 
+local function format_notes(prop)
+	local text = ical.text(prop) or ""
+	if text == "" then
+		return ""
+	end
+	-- Ensure a blank line before "Microsoft Teams meeting" if attached directly to notes
+	text = text:gsub("([^\n])\r?\n(Microsoft Teams [Mm]eeting)", "%1\n\n%2")
+	return text
+end
+
+local function parse_attendees(doc, range)
+	local out = {}
+	for _, prop in ipairs(ical.get_all(doc, range, "ATTENDEE")) do
+		local raw = prop.value or ""
+		local email = raw:gsub("^mailto:", "", 1):gsub("^MAILTO:", "", 1)
+		email = ical.unescape(email)
+		local cn = prop.params.CN and ical.unescape(prop.params.CN) or nil
+		table.insert(out, {
+			email = email,
+			name = cn or email,
+			cn = cn,
+			partstat = prop.params.PARTSTAT,
+			role = prop.params.ROLE,
+			cutype = prop.params.CUTYPE,
+		})
+	end
+	return #out > 0 and out or nil
+end
+
+local function parse_organizer(doc, range)
+	local prop = ical.get(doc, range, "ORGANIZER")
+	if not prop then
+		return nil
+	end
+	local raw = prop.value or ""
+	local email = raw:gsub("^mailto:", "", 1):gsub("^MAILTO:", "", 1)
+	email = ical.unescape(email)
+	local cn = prop.params.CN and ical.unescape(prop.params.CN) or nil
+	return { email = email, name = cn or email, cn = cn, email_raw = prop.value }
+end
+
+local function parse_location(doc, range)
+	local prop = ical.get(doc, range, "LOCATION")
+	if not prop then
+		return nil
+	end
+	return ical.text(prop)
+end
+
+local function is_teams_event(doc, range)
+	local loc = ical.text(ical.get(doc, range, "LOCATION")) or ""
+	if loc:lower():find("teams") then
+		return true
+	end
+	for _, prop in ipairs(ical.get_all(doc, range, "X-MICROSOFT-IS-ONLINE-MEETING")) do
+		if prop.value and prop.value:upper() == "TRUE" then
+			return true
+		end
+	end
+	for _, prop in ipairs(ical.get_all(doc, range, "X-MICROSOFT-SKYPETEAMSMEETING")) do
+		if prop.value and prop.value:upper() == "TRUE" then
+			return true
+		end
+	end
+	return nil
+end
+
 -- A date-time as an absolute instant, whatever form it arrived in.
 local function to_instant(dt, tzid)
 	if dt.utc then
@@ -95,9 +162,13 @@ function M.from_ical(text)
 			date = string.format("%04d-%02d-%02d", dtstart.year, dtstart.month, dtstart.day),
 			start_min = 0,
 			duration_min = days * 1440,
-			notes = ical.text(ical.get(doc, range, "DESCRIPTION")) or "",
+			notes = format_notes(ical.get(doc, range, "DESCRIPTION")),
 			all_day = true,
 			recurrence = rrule.from_rrule(ical.text(ical.get(doc, range, "RRULE"))) or nil,
+			attendees = parse_attendees(doc, range),
+			organizer = parse_organizer(doc, range),
+			location = parse_location(doc, range),
+			teams = is_teams_event(doc, range),
 		}
 		event.lossy = rrule.unsupported({
 			rrule = ical.text(ical.get(doc, range, "RRULE")),
@@ -138,15 +209,16 @@ function M.from_ical(text)
 	event.block = {
 		title = single_line(ical.text(ical.get(doc, range, "SUMMARY")) or "(untitled)"),
 		date = string.format("%04d-%02d-%02d", starts.year, starts.month, starts.day),
-		start_min = utils.snap(starts.hour * 60 + starts.min, config.options.granularity),
-		duration_min = math.max(
-			config.options.granularity,
-			utils.snap(duration_min, config.options.granularity)
-		),
-		notes = ical.text(ical.get(doc, range, "DESCRIPTION")) or "",
+		start_min = starts.hour * 60 + starts.min,
+		duration_min = math.max(1, duration_min),
+		notes = format_notes(ical.get(doc, range, "DESCRIPTION")),
 		-- A rule we could not model is kept on the server untouched; the block
 		-- just shows as a one-off so we never imply we own the series.
 		recurrence = recurrence,
+		attendees = parse_attendees(doc, range),
+		organizer = parse_organizer(doc, range),
+		location = parse_location(doc, range),
+		teams = is_teams_event(doc, range),
 	}
 
 	M.apply_exdates(doc, range, event.block)
@@ -256,8 +328,11 @@ function M.to_ical(block)
 		dtend_params = times.dtend.params,
 		summary = block.title,
 		description = block.notes,
+		location = block.location,
+		teams = block.teams,
 		rrule = rrule.to_rrule(block.recurrence),
 		exdate = rrule.to_exdate(block.recurrence),
+		attendees = block.attendees,
 	})
 end
 

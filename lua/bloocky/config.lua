@@ -5,7 +5,7 @@ M.options = {
 	save_path = vim.fn.stdpath("data") .. "/bloocky_blocks.json",
 
 	-- View shown when the calendar opens: "day" | "week" | "month"
-	default_view = "week",
+	default_view = "day",
 
 	-- First day of the week: "sunday" | "monday"
 	week_start = "sunday",
@@ -19,8 +19,16 @@ M.options = {
 	-- Block start/duration are snapped to this many minutes
 	granularity = 30,
 
+	-- How block creation / editing dialog is opened:
+	-- "vsplit" (structured markdown vertical buffer) | "float" (floating inputs) | "split"
+	dialog = {
+		mode = "vsplit",
+	},
+
 	window = {
-		-- How the calendar is displayed: "float" | "sidebar"
+		-- How the calendar is displayed: "float" | "sidebar" | "buffer"
+		-- "buffer" replaces the current buffer (buflisted, jumpable via :b)
+		-- alias "replace" is accepted for "buffer"
 		mode = "float",
 
 		-- Width per view: fraction of the editor width (or absolute columns if > 1),
@@ -44,7 +52,7 @@ M.options = {
 		sidebar = {
 			position = "right", -- "left" | "right"
 			width = 46, -- columns (or a fraction of the editor width if <= 1)
-			view = "day", -- view the sidebar opens in
+			view = "week", -- view the sidebar opens in
 		},
 	},
 
@@ -176,7 +184,9 @@ M.options = {
 			cycle_view = "<Tab>",
 			today = "t",
 			add = "a",
-			edit = "<CR>",
+			edit = "<CR>", -- now opens markdown details (see detail_hsplit/vsplit for splits)
+			detail_hsplit = "<C-s>", -- details in horizontal split
+			detail_vsplit = "<C-v>", -- details in vertical split
 			delete = "x",
 			sync = "s", -- sync now (only bound when sync.enabled)
 			close = "q",

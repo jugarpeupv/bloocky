@@ -83,9 +83,14 @@ function M.secret(account, field)
 	end
 
 	local plain = account[field]
-	if plain and plain ~= "" then
+	if plain ~= nil then
 		secrets[key] = plain
 		return plain, nil
+	end
+
+	if field == "password" and account.auth_cmd then
+		secrets[key] = ""
+		return "", nil
 	end
 
 	return nil, ("%s: no %s or %s_cmd configured"):format(account.id, field, field)
@@ -139,8 +144,8 @@ function M.validate(account)
 		if not account.username then
 			table.insert(problems, "caldav accounts need a `username`")
 		end
-		if not (account.password or account.password_cmd) then
-			table.insert(problems, "caldav accounts need `password_cmd` (preferred) or `password`")
+		if not (account.password or account.password_cmd or account.auth_cmd) then
+			table.insert(problems, "caldav accounts need `password_cmd` (preferred), `password`, or `auth_cmd`")
 		end
 	end
 
@@ -172,7 +177,7 @@ function M.validate(account)
 		)
 	end
 
-	if account.password and not account.password_cmd then
+	if account.password and account.password ~= "" and not account.password_cmd then
 		table.insert(
 			problems,
 			"WARN " .. account.id .. ": `password` is stored in plain text in your config; prefer `password_cmd`"

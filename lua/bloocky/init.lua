@@ -18,13 +18,13 @@ function M.setup(opts)
 	local keymaps = config.options.keymaps
 	if keymaps.toggle then
 		vim.keymap.set("n", keymaps.toggle, function()
-			require("bloocky.ui").toggle()
-		end, { noremap = true, silent = true, desc = "Bloocky: toggle calendar" })
+			require("bloocky.ui").toggle({ view = "day" })
+		end, { noremap = true, silent = true, desc = "Bloocky: toggle calendar (day)" })
 	end
 	if keymaps.toggle_sidebar then
 		vim.keymap.set("n", keymaps.toggle_sidebar, function()
-			require("bloocky.ui").toggle_sidebar()
-		end, { noremap = true, silent = true, desc = "Bloocky: toggle calendar sidebar" })
+			require("bloocky.ui").toggle_sidebar("week")
+		end, { noremap = true, silent = true, desc = "Bloocky: toggle calendar (week)" })
 	end
 
 	local views = function()
@@ -129,14 +129,39 @@ function M.setup(opts)
 				vim.notify("Bloocky: no sync account called " .. cmd.args, vim.log.levels.ERROR)
 				return
 			end
-			require("bloocky.sync.oauth").authorize(account, function(err)
-				if err then
-					vim.notify("Bloocky: authorization failed - " .. err, vim.log.levels.ERROR)
-				else
-					vim.notify("Bloocky: " .. account.id .. " is authorised", vim.log.levels.INFO)
-				end
-			end)
-		end, { nargs = 1, complete = account_names, desc = "Authorise a sync account with OAuth" })
+			if account.provider == "google" then
+				require("bloocky.sync.oauth").authorize(account, function(err)
+					if err then
+						vim.notify("Bloocky: authorization failed - " .. err, vim.log.levels.ERROR)
+					else
+						vim.notify("Bloocky: " .. account.id .. " is authorised", vim.log.levels.INFO)
+						pcall(function()
+							require("bloocky.ui").schedule_sync()
+						end)
+					end
+				end)
+			elseif account.auth_cmd then
+				local cmd_spec = type(account.auth_cmd) == "string" and { "zsh", "-ic", account.auth_cmd } or account.auth_cmd
+				vim.notify("Bloocky: authenticating " .. account.id .. "...", vim.log.levels.INFO)
+				vim.fn.jobstart(cmd_spec, {
+					pty = true,
+					on_exit = function(_, code)
+						vim.schedule(function()
+							if code == 0 then
+								vim.notify("Bloocky: " .. account.id .. " authenticated successfully", vim.log.levels.INFO)
+								pcall(function()
+									require("bloocky.ui").schedule_sync()
+								end)
+							else
+								vim.notify("Bloocky: auth command failed (exit " .. code .. ")", vim.log.levels.ERROR)
+							end
+						end)
+					end,
+				})
+			else
+				vim.notify("Bloocky: " .. account.id .. " is a caldav account with no auth_cmd configured", vim.log.levels.WARN)
+			end
+		end, { nargs = 1, complete = account_names, desc = "Authorise a sync account (OAuth or auth_cmd)" })
 
 		vim.api.nvim_create_user_command("BloockySyncRevoke", function(cmd)
 			local account = require("bloocky.sync.account").get(cmd.args)

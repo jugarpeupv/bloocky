@@ -120,28 +120,48 @@ end
 local function push_deletions(account, calendars, report)
 	local provider = providers.for_account(account)
 	for _, tombstone in ipairs(vim.deepcopy(store.tombstones(account.id))) do
-		local result, err = provider.delete_event(account, tombstone)
+		local handled_by_teams = false
+		if (tombstone.teams or tombstone.graph_id) and (account.auth_cmd or account.davmail_token_file) then
+			local ok, res, res_err = pcall(function()
+				local davmail = require("bloocky.sync.davmail")
+				return davmail.delete_online_meeting(account, tombstone)
+			end)
+			if ok and res then
+				handled_by_teams = true
+				store.clear_tombstone(tombstone.id)
+				bump(report.pushed, "deleted")
+			elseif not ok then
+				table.insert(report.errors, ("Teams deletion (%s): %s"):format(tombstone.title or "?", tostring(res)))
+			elseif res_err then
+				table.insert(report.errors, ("Teams deletion (%s): %s"):format(tombstone.title or "?", res_err))
+			end
+		end
 
-		if err then
-			table.insert(report.errors, ("could not delete %q: %s"):format(tombstone.title or "?", err))
-		elseif result.conflict then
-			-- Changed remotely after we deleted it here. Remote wins, so the
-			-- deletion is abandoned and the pull will bring the event back.
-			table.insert(report.conflicts, {
-				kind = "delete-vs-edit",
-				title = tombstone.title,
-				resolution = "kept the remote event; your deletion was undone",
-			})
-			store.record_conflict({
-				block_id = tombstone.id,
-				kind = "delete-vs-edit",
-				title = tombstone.title,
-				account = account.id,
-			})
-			store.clear_tombstone(tombstone.id)
-		else
-			store.clear_tombstone(tombstone.id)
-			bump(report.pushed, "deleted")
+		if not handled_by_teams then
+			local result, err = provider.delete_event(account, tombstone)
+
+			if err then
+				table.insert(report.errors, ("could not delete %q: %s"):format(tombstone.title or "?", err))
+			elseif result.conflict then
+				-- Changed remotely after we deleted it here. Remote wins, so the
+				-- deletion is abandoned and the pull will bring the event back.
+				table.insert(report.conflicts, {
+					kind = "delete-vs-edit",
+					title = tombstone.title,
+					resolution = "kept the remote event; your deletion was undone",
+				})
+				store.record_conflict({
+					block_id = tombstone.id,
+					kind = "delete-vs-edit",
+					title = tombstone.title,
+					account = account.id,
+					local_version = tombstone,
+				})
+				store.clear_tombstone(tombstone.id)
+			else
+				store.clear_tombstone(tombstone.id)
+				bump(report.pushed, "deleted")
+			end
 		end
 	end
 end
@@ -243,7 +263,34 @@ local function push_creations(account, calendars, changes, report)
 		-- another account must not be duplicated into this one.
 		local source = block.source or "local"
 		if source == account.id or (source == "local" and account.is_default) then
-			do
+			local handled_by_teams = false
+			if block.teams and (account.auth_cmd or account.davmail_token_file) then
+				local ok, res, res_err = pcall(function()
+					local davmail = require("bloocky.sync.davmail")
+					return davmail.create_online_meeting(account, block)
+				end)
+				if ok and res and (res.id or res.iCalUId) then
+					handled_by_teams = true
+					block.source = account.id
+					store.mark_synced(block, {
+						account = account.id,
+						calendar = target.href,
+						uid = res.iCalUId or res.id,
+						graph_id = res.id,
+						teams = true,
+						href = nil,
+						etag = res["@odata.etag"],
+						raw = nil,
+					})
+					bump(report.pushed, "created")
+				elseif not ok then
+					table.insert(report.errors, ("Teams meeting (%s): %s"):format(block.title, tostring(res)))
+				elseif res_err then
+					table.insert(report.errors, ("Teams meeting (%s): %s"):format(block.title, res_err))
+				end
+			end
+
+			if not handled_by_teams then
 				local result, err = provider.create_event(account, target, block)
 
 				if err then
@@ -332,6 +379,10 @@ local function apply_remote(account, calendar, response, report)
 			for key, value in pairs(event.block) do
 				existing[key] = value
 			end
+			-- attendees/organizer/location may be nil to clear; pairs() skips nil
+			existing.attendees = event.block.attendees
+			existing.organizer = event.block.organizer
+			existing.location = event.block.location
 			existing.updated_at = os.time()
 			bump(report.pulled, "updated")
 		end
@@ -376,15 +427,18 @@ end
 local function pull_calendar(account, calendar, report)
 	local provider = providers.for_account(account)
 	local cursor = store.calendar_cursor(account.id, calendar.href)
-	local result, err = provider.fetch(account, calendar, cursor, sync_window())
+	local win = sync_window()
+	local result, err = provider.fetch(account, calendar, cursor, win)
 
 	if err then
 		table.insert(report.errors, ("%s: %s"):format(calendar.name, err))
 		return
 	end
 
+	local seen_hrefs = {}
 	for _, response in ipairs(result.changed) do
 		if response.data then
+			seen_hrefs[response.href] = true
 			apply_remote(account, calendar, response, report)
 		end
 	end
@@ -397,6 +451,33 @@ local function pull_calendar(account, calendar, report)
 			-- Drop the mapping first: state.delete_block writes a tombstone
 			-- when a mapping exists, and we must not ask the server to delete
 			-- something it has already deleted.
+			store.remove_mapping(block.id)
+			state.delete_block(block.id)
+			bump(report.pulled, "deleted")
+		end
+	end
+
+	-- For servers without RFC 6578 sync-collection (or during full window fetch):
+	-- any mapped block in this calendar within the sync window that was not returned by the server
+	-- has been deleted on the server.
+	if not cursor or not result.cursor then
+		local win_start = win.start:sub(1, 8)
+		local win_end = win["end"]:sub(1, 8)
+		local to_delete = {}
+		for block_id, mapping in pairs(store.ensure_loaded().mappings or {}) do
+			if mapping.account == account.id and mapping.calendar == calendar.href then
+				local block = find_block(block_id)
+				if block and block.date then
+					local bdate = block.date:gsub("%-", "")
+					if bdate >= win_start and bdate <= win_end then
+						if not seen_hrefs[mapping.href] then
+							table.insert(to_delete, block)
+						end
+					end
+				end
+			end
+		end
+		for _, block in ipairs(to_delete) do
 			store.remove_mapping(block.id)
 			state.delete_block(block.id)
 			bump(report.pulled, "deleted")
@@ -516,7 +597,7 @@ end
 -- Entry point
 --------------------------------------------------------------------------
 
-function M.sync_account(account, done)
+function M.sync_account(account, done, retrying)
 	local report = new_report(account.id)
 
 	async.run(function()
@@ -545,6 +626,48 @@ function M.sync_account(account, done)
 		if err then
 			table.insert(report.errors, tostring(err))
 		end
+
+		local needs_auth = false
+		for _, e in ipairs(report.errors) do
+			if e:find("503") or e:find("DavMail/MFA session expired") or e:find("token file not found") or e:find("could not decrypt davmail token") or e:find("Failed to obtain token") or e:find("authentication failed") then
+				needs_auth = true
+				break
+			end
+		end
+
+		if needs_auth and account.auth_cmd and not retrying then
+			local cmd_spec = type(account.auth_cmd) == "string" and { "zsh", "-ic", account.auth_cmd }
+				or account.auth_cmd
+			vim.notify(
+				("Bloocky sync (%s): session expired or token missing, running %s..."):format(
+					account.id,
+					type(account.auth_cmd) == "string" and account.auth_cmd or "auth_cmd"
+				),
+				vim.log.levels.WARN
+			)
+			vim.fn.jobstart(cmd_spec, {
+				pty = true,
+				on_exit = function(_, code)
+					vim.schedule(function()
+						if code == 0 then
+							vim.notify(
+								("Bloocky sync (%s): authentication completed, retrying sync..."):format(account.id),
+								vim.log.levels.INFO
+							)
+							M.sync_account(account, done, true)
+						else
+							vim.notify(
+								("Bloocky sync (%s): auth command failed (exit %d)"):format(account.id, code),
+								vim.log.levels.ERROR
+							)
+							done(report)
+						end
+					end)
+				end,
+			})
+			return
+		end
+
 		done(report)
 	end)
 end

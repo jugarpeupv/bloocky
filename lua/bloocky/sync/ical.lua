@@ -397,9 +397,26 @@ function M.build(event)
 	table.insert(lines, "DTEND" .. (event.dtend_params or "") .. ":" .. event.dtend)
 	add("SUMMARY", event.summary)
 	add("DESCRIPTION", event.description)
+	if event.teams then
+		add("LOCATION", (event.location and event.location ~= "") and event.location or "Microsoft Teams Meeting")
+		table.insert(lines, "X-MICROSOFT-IS-ONLINE-MEETING:TRUE")
+		table.insert(lines, "X-MICROSOFT-SKYPETEAMSMEETING:TRUE")
+		table.insert(lines, "X-MICROSOFT-ONLINEMEETINGCONFERENCING:TRUE")
+	elseif event.location and event.location ~= "" then
+		add("LOCATION", event.location)
+	end
 	add("RRULE", event.rrule, true)
 	if event.exdate and event.exdate ~= "" then
 		table.insert(lines, "EXDATE;VALUE=DATE:" .. event.exdate)
+	end
+	if event.attendees and type(event.attendees) == "table" then
+		for _, a in ipairs(event.attendees) do
+			local email = a.email or ""
+			local cn = (a.name and a.name ~= "" and a.name ~= email) and (";CN=" .. M.escape(a.name)) or ""
+			if email ~= "" then
+				table.insert(lines, "ATTENDEE" .. cn .. ":mailto:" .. email)
+			end
+		end
 	end
 
 	table.insert(lines, "END:VEVENT")

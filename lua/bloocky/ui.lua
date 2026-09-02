@@ -16,13 +16,21 @@ local buf, win = nil, nil
 local ns = vim.api.nvim_create_namespace("bloocky")
 
 M.view = nil
-M.mode = nil -- "float" | "sidebar"
+M.mode = nil -- "float" | "sidebar" | "buffer"
 M.cursor = nil -- { date = { year, month, day }, min = minutes from midnight }
 
 local function is_open()
 	return win ~= nil and vim.api.nvim_win_is_valid(win)
 end
 M.is_open = is_open
+
+-- Called by detail view when it replaces the calendar window's buffer
+-- (buffer mode). Keeps the calendar buffer (buflisted, hidden) but marks
+-- the calendar as closed so :Bloocky toggle works again.
+function M._on_detail_replaced_buffer()
+	win = nil
+	-- keep buf (buflisted) for :b jump
+end
 
 --------------------------------------------------------------------------
 -- The "syncing" indicator
@@ -113,6 +121,16 @@ end
 
 local function sidebar_options()
 	return config.options.window.sidebar or {}
+end
+
+local function resolve_mode(mode)
+	if mode == "replace" then
+		return "buffer"
+	end
+	if mode == "buffer" or mode == "sidebar" or mode == "float" then
+		return mode
+	end
+	return "float"
 end
 
 local function sync_enabled()
@@ -263,6 +281,9 @@ local function content_width()
 		-- The split may have been resized by hand, so trust the window itself
 		return is_open() and vim.api.nvim_win_get_width(win) or sidebar_width()
 	end
+	if M.mode == "buffer" then
+		return is_open() and vim.api.nvim_win_get_width(win) or vim.o.columns
+	end
 
 	local usable = math.max(20, vim.o.columns - border_cells())
 	local w = per_view(config.options.window.width) or 0.8
@@ -281,6 +302,10 @@ local function max_height()
 	if M.mode == "sidebar" then
 		local h = is_open() and vim.api.nvim_win_get_height(win) or (vim.o.lines - vim.o.cmdheight - 2)
 		-- The winbar carries the title and takes a row out of the window
+		return math.max(6, h - 1)
+	end
+	if M.mode == "buffer" then
+		local h = is_open() and vim.api.nvim_win_get_height(win) or (vim.o.lines - vim.o.cmdheight - 1)
 		return math.max(6, h - 1)
 	end
 	return math.max(6, vim.o.lines - vim.o.cmdheight - border_cells() - 1)
@@ -348,10 +373,13 @@ function M.render()
 	}
 	local lines, hls, meta = views[M.view].render(ctx)
 
-	if M.mode == "sidebar" then
-		-- A split cannot carry a title, so the winbar stands in for it
+	if M.mode == "sidebar" or M.mode == "buffer" then
+		-- A split / buffer cannot carry a float title, so the winbar stands in for it
 		local title = (meta.title or " Bloocky "):gsub("%%", "%%%%")
-		vim.api.nvim_set_option_value("winbar", "%=" .. title .. "%=", { win = win })
+		pcall(vim.api.nvim_set_option_value, "winbar", "%=" .. title .. "%=", { win = win })
+		if M.mode == "buffer" then
+			-- keep footer visible as last line hint in buffer mode? no float footer
+		end
 	else
 		local width = meta.width or ctx.width
 		local rows = math.min(#lines, ctx.height)
@@ -374,6 +402,7 @@ function M.render()
 	vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 	vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+	pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
 
 	vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
 	for _, h in ipairs(hls) do
@@ -501,6 +530,18 @@ function M.edit_block()
 	end)
 end
 
+-- Show block details as markdown (replaces dialog for viewing)
+function M.open_detail(split)
+	local blocks = hits_at_cursor()
+	if #blocks == 0 then
+		M.add_block()
+		return
+	end
+	pick_block(blocks, function(block)
+		require("bloocky.detail").open(block, { split = split or "current" })
+	end)
+end
+
 -- Delete the block under the cursor
 function M.delete_block()
 	local blocks = hits_at_cursor()
@@ -581,7 +622,17 @@ local function setup_keymaps()
 	end)
 	map(km.cycle_view, M.cycle_view)
 	map(km.add, M.add_block)
-	map(km.edit, M.edit_block)
+	-- <CR> now shows markdown details instead of the floating edit dialog
+	map(km.edit or "<CR>", function()
+		M.open_detail("current")
+	end)
+	-- splits for details: <C-s> horizontal, <C-v> vertical
+	map(km.detail_hsplit or "<C-s>", function()
+		M.open_detail("horizontal")
+	end)
+	map(km.detail_vsplit or "<C-v>", function()
+		M.open_detail("vertical")
+	end)
 	map(km.delete, M.delete_block)
 	if km.sync and sync_enabled() then
 		map(km.sync, function()
@@ -589,8 +640,8 @@ local function setup_keymaps()
 		end)
 	end
 	map(km.close, M.close)
-	if M.mode ~= "sidebar" then
-		-- In a sidebar <Esc> is far too eager: it is a window you keep around
+	if M.mode == "float" then
+		-- In sidebar/buffer <Esc> is too eager: they are windows you keep around
 		map("<Esc>", M.close)
 	end
 end
@@ -645,6 +696,37 @@ local function open_sidebar()
 	end
 end
 
+local function open_buffer()
+	-- Replace current buffer in current window (or a normal window if we are in a float)
+	local target = vim.api.nvim_get_current_win()
+	if vim.api.nvim_win_get_config(target).relative ~= "" then
+		for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+			if vim.api.nvim_win_get_config(w).relative == "" then
+				target = w
+				break
+			end
+		end
+	end
+	win = target
+	vim.api.nvim_set_current_win(win)
+	vim.api.nvim_win_set_buf(win, buf)
+	-- Mirror sidebar window opts so width maths match text area (otherwise
+	-- number/signcolumn eat 4+ columns and Sunday gets chopped with `wrap=false`)
+	for name, value in pairs({
+		cursorline = false,
+		wrap = false,
+		number = false,
+		relativenumber = false,
+		list = false,
+		spell = false,
+		signcolumn = "no",
+		foldcolumn = "0",
+		statuscolumn = "",
+	}) do
+		pcall(vim.api.nvim_set_option_value, name, value, { win = win, scope = "local" })
+	end
+end
+
 -- Normalise the public argument: a view name, or { view = ..., mode = ... }
 local function normalize(opts)
 	if type(opts) == "string" then
@@ -659,10 +741,8 @@ function M.open(opts)
 	highlights.setup()
 	state.ensure_loaded()
 
-	local mode = opts.mode or (is_open() and M.mode) or config.options.window.mode or "float"
-	if mode ~= "sidebar" then
-		mode = "float"
-	end
+	local raw_mode = opts.mode or (is_open() and M.mode) or config.options.window.mode or "float"
+	local mode = resolve_mode(raw_mode)
 
 	local keep_cursor, keep_view = nil, nil
 	if is_open() then
@@ -688,12 +768,39 @@ function M.open(opts)
 	local now = os.date("*t")
 	M.cursor = keep_cursor or { date = utils.today(), min = now.hour * 60 }
 
-	buf = vim.api.nvim_create_buf(false, true)
-	vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
-	vim.api.nvim_set_option_value("filetype", "bloocky", { buf = buf })
+	-- Reuse existing buflisted buffer when in buffer mode
+	if mode == "buffer" and buf and vim.api.nvim_buf_is_valid(buf) then
+		-- keep existing buffer, just ensure filetype
+		vim.api.nvim_set_option_value("filetype", "bloocky", { buf = buf })
+	else
+		local listed = mode == "buffer"
+		buf = vim.api.nvim_create_buf(listed, false)
+		vim.api.nvim_set_option_value("buftype", "nofile", { buf = buf })
+		vim.api.nvim_set_option_value("swapfile", false, { buf = buf })
+		if mode == "buffer" then
+			vim.api.nvim_set_option_value("bufhidden", "hide", { buf = buf })
+			pcall(vim.api.nvim_buf_set_name, buf, "bloocky://calendar/" .. mode)
+		else
+			vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
+		end
+		vim.api.nvim_set_option_value("filetype", "bloocky", { buf = buf })
+
+		-- :e on calendar buffer re-renders and triggers sync
+		vim.api.nvim_create_autocmd("BufReadCmd", {
+			buffer = buf,
+			callback = function()
+				M.render()
+				if sync_enabled() then
+					M.schedule_sync()
+				end
+			end,
+		})
+	end
 
 	if mode == "sidebar" then
 		open_sidebar()
+	elseif mode == "buffer" then
+		open_buffer()
 	else
 		open_float()
 	end
@@ -705,7 +812,10 @@ function M.open(opts)
 		once = true,
 		callback = function()
 			win = nil
-			buf = nil
+			if M.mode ~= "buffer" then
+				buf = nil
+			end
+			-- buffer mode keeps buf (buflisted) so we can :b bloocky
 		end,
 	})
 
@@ -758,13 +868,27 @@ function M.open(opts)
 end
 
 function M.open_sidebar(view)
-	M.open({ view = view or sidebar_options().view, mode = "sidebar" })
+	local so = sidebar_options()
+	local mode = resolve_mode(config.options.window.mode or "float")
+	M.open({ view = view or so.view, mode = mode })
 end
 
 function M.close()
 	status_teardown()
 	stop_periodic()
 	if is_open() then
+		if M.mode == "buffer" then
+			-- keep buffer listed; just close window or hide it
+			if not pcall(vim.api.nvim_win_close, win, true) then
+				-- last window - hide buffer instead of deleting
+				pcall(vim.api.nvim_buf_set_option, buf, "bufhidden", "hide")
+				-- try to switch to alternate buffer
+				pcall(vim.cmd, "b#")
+			end
+			win = nil
+			-- keep buf for :b jump (buflisted)
+			return
+		end
 		-- Closing the last window of a tab is refused; drop the buffer instead
 		if not pcall(vim.api.nvim_win_close, win, true) then
 			pcall(vim.api.nvim_buf_delete, buf, { force = true })
@@ -785,7 +909,9 @@ function M.toggle(opts)
 end
 
 function M.toggle_sidebar(view)
-	M.toggle({ view = view or sidebar_options().view, mode = "sidebar" })
+	local so = sidebar_options()
+	local mode = resolve_mode(config.options.window.mode or "float")
+	M.toggle({ view = view or so.view, mode = mode })
 end
 
 return M

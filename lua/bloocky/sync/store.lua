@@ -167,6 +167,8 @@ function M.record_deletion(block)
 		etag = mapping.etag,
 		title = block.title, -- kept for the report; the block itself is gone by then
 		deleted_at = os.time(),
+		teams = block.teams or mapping.teams,
+		graph_id = mapping.graph_id,
 	}
 	table.insert(data.tombstones, tombstone)
 	data.mappings[block.id] = nil

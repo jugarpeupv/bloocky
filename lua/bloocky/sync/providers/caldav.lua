@@ -234,12 +234,21 @@ function M.discover(account)
 		return M.list_calendars(account, M.resolve(base, account.calendar_home))
 	end
 
+	-- Direct calendar/home URL check (e.g. DavMail /users/<email>/ or /calendar/)
+	local direct = M.list_calendars(account, base)
+	if direct and #direct > 0 then
+		return direct, nil
+	end
+
 	local err, res = dav(account, "PROPFIND", base, M.propfind_body({ "d:current-user-principal" }), nil, "0")
 	if err then
 		return nil, err
 	end
 	if res.status == 401 then
 		return nil, "authentication failed for " .. account.id .. " (check username and password_cmd)"
+	end
+	if res.status == 503 then
+		return nil, ("server returned 503 for %s (DavMail/MFA session expired - run :BloockySyncAuth %s)"):format(account.id, account.id)
 	end
 	if res.status >= 400 then
 		return nil, ("discovery failed at %s (HTTP %d)"):format(base, res.status)

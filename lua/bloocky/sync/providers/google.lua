@@ -236,6 +236,21 @@ function M.event_body(block, opts)
 		start = slot(block.start_min),
 		["end"] = slot(block.start_min + block.duration_min),
 	}
+	if block.attendees and #block.attendees > 0 then
+		local att_list = {}
+		for _, a in ipairs(block.attendees) do
+			if a.email and a.email ~= "" then
+				local att = { email = a.email }
+				if a.name and a.name ~= "" and a.name ~= a.email then
+					att.displayName = a.name
+				end
+				table.insert(att_list, att)
+			end
+		end
+		if #att_list > 0 then
+			body.attendees = att_list
+		end
+	end
 	if not (body.start and body["end"]) then
 		return nil, "block has an unusable date: " .. tostring(block.date)
 	end
