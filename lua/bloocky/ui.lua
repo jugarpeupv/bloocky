@@ -20,9 +20,29 @@ M.mode = nil -- "float" | "sidebar" | "buffer"
 M.cursor = nil -- { date = { year, month, day }, min = minutes from midnight }
 
 local function is_open()
-	return win ~= nil and vim.api.nvim_win_is_valid(win)
+	if win == nil or buf == nil then
+		return false
+	end
+	if not vim.api.nvim_win_is_valid(win) then
+		return false
+	end
+	if not vim.api.nvim_buf_is_valid(buf) then
+		return false
+	end
+	-- In buffer mode the user can navigate away (e.g. jump back to the
+	-- previous buffer) leaving the window showing another buffer. The
+	-- calendar is then hidden, not open: reopening must restore the full
+	-- buffer, not just repaint the winbar over someone else's file.
+	local ok, cur = pcall(vim.api.nvim_win_get_buf, win)
+	return ok and cur == buf
 end
 M.is_open = is_open
+
+local function clear_winbar(win_id)
+	if win_id and vim.api.nvim_win_is_valid(win_id) then
+		pcall(vim.api.nvim_set_option_value, "winbar", "", { win = win_id })
+	end
+end
 
 -- Called by detail view when it replaces the calendar window's buffer
 -- (buffer mode). Keeps the calendar buffer (buflisted, hidden) but marks
@@ -399,12 +419,18 @@ function M.render()
 		})
 	end
 
-	vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
-	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-	vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+	if not pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = buf }) then
+		return
+	end
+	if not pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, lines) then
+		return
+	end
+	pcall(vim.api.nvim_set_option_value, "modifiable", false, { buf = buf })
 	pcall(vim.api.nvim_set_option_value, "modified", false, { buf = buf })
 
-	vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+	if not pcall(vim.api.nvim_buf_clear_namespace, buf, ns, 0, -1) then
+		return
+	end
 	for _, h in ipairs(hls) do
 		pcall(vim.api.nvim_buf_set_extmark, buf, ns, h.line, h.s, {
 			end_col = h.e,
@@ -819,6 +845,21 @@ function M.open(opts)
 		end,
 	})
 
+	-- External wipe (e.g. `:bwipeout!`) bypasses M.close(): drop the stale
+	-- window title and internal state so a reopen starts fresh instead of
+	-- rendering into an invalid buffer.
+	vim.api.nvim_create_autocmd("BufWipeout", {
+		buffer = buf,
+		once = true,
+		callback = function()
+			clear_winbar(win)
+			status_teardown()
+			stop_periodic()
+			win = nil
+			buf = nil
+		end,
+	})
+
 	-- Refit the layout to the new terminal size
 	vim.api.nvim_create_autocmd("VimResized", {
 		buffer = buf,
@@ -878,10 +919,11 @@ function M.close()
 	stop_periodic()
 	if is_open() then
 		if M.mode == "buffer" then
+			clear_winbar(win)
 			-- keep buffer listed; just close window or hide it
 			if not pcall(vim.api.nvim_win_close, win, true) then
 				-- last window - hide buffer instead of deleting
-				pcall(vim.api.nvim_buf_set_option, buf, "bufhidden", "hide")
+				pcall(vim.api.nvim_set_option_value, "bufhidden", "hide", { buf = buf })
 				-- try to switch to alternate buffer
 				pcall(vim.cmd, "b#")
 			end
