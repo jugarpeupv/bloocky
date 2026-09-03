@@ -28,18 +28,74 @@ local function find_davmail_jar()
 	return nil
 end
 
-local function token_file_path(account)
-	if account.davmail_token_file then
-		return vim.fn.expand(account.davmail_token_file)
+local function get_davmail_props()
+	local p = vim.fn.expand("~/.davmail.properties")
+	if vim.fn.filereadable(p) ~= 1 then p = vim.fn.expand("~/.config/davmail/davmail.properties") end
+	if vim.fn.filereadable(p) ~= 1 then p = vim.fn.expand("~/dotfiles/davmail/.davmail.properties") end
+	return p
+end
+
+local function read_prop(key)
+	local prop_path = get_davmail_props()
+	if vim.fn.filereadable(prop_path) == 1 then
+		for _, line in ipairs(vim.fn.readfile(prop_path)) do
+			local k, v = line:match("^%s*([^#][^=]*)=(.*)$")
+			if k and k:match("^%s*" .. key .. "%s*$") then
+				return v:gsub("^%s+", ""):gsub("%s+$", "")
+			end
+		end
 	end
-	return vim.fn.expand("~/.config/davmail/oauth_tokens.env")
+	return nil
+end
+
+local function token_file_path(account)
+	local candidates = {}
+
+	local explicit = account.davmail_token_file or account.token_file
+	if explicit and explicit ~= "" then
+		table.insert(candidates, { path = vim.fn.expand(explicit), source = "account config (davmail_token_file)" })
+	end
+
+	local prop_path = get_davmail_props()
+	if prop_path and vim.fn.filereadable(prop_path) == 1 then
+		local prop_val = read_prop("davmail.oauth.tokenFilePath")
+		if prop_val and prop_val ~= "" then
+			table.insert(candidates, { path = vim.fn.expand(prop_val), source = prop_path .. " [davmail.oauth.tokenFilePath]" })
+		end
+	end
+
+	for _, c in ipairs(candidates) do
+		if vim.fn.filereadable(c.path) == 1 then
+			return c.path, nil
+		end
+	end
+
+	local searched = {}
+	for _, c in ipairs(candidates) do
+		table.insert(searched, string.format("'%s' (%s)", c.path, c.source))
+	end
+
+	local prop_sources = { "~/.davmail.properties", "~/.config/davmail/davmail.properties", "~/dotfiles/davmail/.davmail.properties" }
+	local msg
+	if #searched > 0 then
+		msg = string.format("DavMail token file not found on disk. Checked: [%s]", table.concat(searched, ", "))
+	else
+		msg = string.format(
+			"DavMail token file is not configured for account %s. Please set `davmail_token_file` in setup() or configure `davmail.oauth.tokenFilePath` in DavMail properties (searched: %s).",
+			account.id or "default",
+			table.concat(prop_sources, ", ")
+		)
+	end
+
+	return nil, msg
 end
 
 --- Extract refresh token from DavMail's store (decrypting with Java if {AES} encrypted)
 function M.get_refresh_token(account)
-	local token_file = token_file_path(account)
-	if vim.fn.filereadable(token_file) ~= 1 then
-		return nil, "token file not found: " .. token_file
+	local token_file, err = token_file_path(account)
+	if not token_file then
+		vim.notify("Bloocky: " .. err, vim.log.levels.ERROR)
+		return nil, err
 	end
 
 	local username = (account.username or ""):lower()
