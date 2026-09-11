@@ -75,6 +75,15 @@ function M.render(block)
 	end
 	local source = block.source or "local"
 	add("- **Source:** " .. source)
+	local cal_label
+	pcall(function()
+		cal_label = require("bloocky.marks").calendar_label(block)
+	end)
+	if cal_label then
+		add("- **Calendar:** " .. cal_label)
+	elseif block.source and block.source ~= "local" then
+		add("- **Calendar:** " .. block.source)
+	end
 	if block.id then
 		add("- **ID:** `" .. block.id .. "`")
 	end

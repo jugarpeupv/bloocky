@@ -14,6 +14,8 @@ local LAYOUT = {
 	{ "Repeat", "right" },
 	{ "Days", "left" },
 	{ "Until", "right" },
+	{ "Calendar", "full" },
+	{ "Teams", "full" },
 	{ "Notes", "full" },
 	{ "Attendees", "full" },
 }
@@ -27,6 +29,8 @@ local HINTS = {
 	Repeat = "none · daily · weekly …",
 	Days = "mon,wed,fri",
 	Until = "empty = forever",
+	Calendar = "izertis / icloud or account/calendar",
+	Teams = "yes / no",
 	Notes = "optional",
 	Attendees = "name <email>, name2 <email2>",
 }
@@ -64,6 +68,19 @@ local function layout()
 	return items, row - 1
 end
 
+local function calendar_initial(block, prefill)
+	if block then
+		local ok, lab = pcall(function() return require("bloocky.marks").calendar_label(block) end)
+		if ok and lab and lab ~= "" then return lab end
+		return block.calendar or block.source or ""
+	end
+	local ok, ui = pcall(require, "bloocky.ui")
+	if ok and ui.calendar_filter then return ui.calendar_filter end
+	local ok2, def = pcall(function() return require("bloocky.ui").default_calendar() end)
+	if ok2 and def then return def end
+	return ""
+end
+
 local function initial_values(opts)
 	local block = opts.block
 	if block then
@@ -83,6 +100,8 @@ local function initial_values(opts)
 		Repeat = r and r.type or "none",
 		Days = table.concat(day_names, ","),
 		Until = (r and r.until_date) or "",
+		Calendar = calendar_initial(block, nil),
+		Teams = block.teams and "yes" or "no",
 		Notes = (block.notes or ""):gsub("\n", " "),
 		Attendees = block.attendees and format_attendees(block.attendees) or "",
 	}
@@ -113,7 +132,10 @@ end
 		Repeat = "none",
 		Days = "",
 		Until = "",
+		Calendar = calendar_initial(nil, prefill),
+		Teams = "no",
 		Notes = "",
+		Attendees = "",
 	}
 end
 
@@ -213,10 +235,6 @@ local function validate(raw)
 		end
 	end
 
-	if next(errs) then
-		return nil, errs
-	end
-
 	duration = math.max(1, duration)
 
 	local recurrence = nil
@@ -234,6 +252,49 @@ local function validate(raw)
 		end
 	end
 
+	-- Calendar: which account/calendar to create in
+	local calendar_id, calendar_account, calendar_href, calendar_name = nil, nil, nil, nil
+	do
+		local cal_raw = vim.trim(tostring(raw.calendar or ""))
+		if cal_raw == "" then
+			local ok, ui = pcall(require, "bloocky.ui")
+			if ok and ui.calendar_filter and ui.calendar_filter ~= "" then
+				cal_raw = ui.calendar_filter
+			else
+				local ok2, def = pcall(function() return require("bloocky.ui").default_calendar() end)
+				if ok2 and def and def ~= "" then cal_raw = def end
+			end
+		end
+		if cal_raw ~= "" and cal_raw:lower() ~= "all" and cal_raw:lower() ~= "local" then
+			local avail = {}
+			pcall(function() avail = require("bloocky.ui").available_calendars() end)
+			local found = nil
+			for _, c in ipairs(avail) do
+				if c.id == cal_raw or c.id:lower() == cal_raw:lower() or c.account:lower() == cal_raw:lower() or c.name:lower() == cal_raw:lower() then
+					found = c; break
+				end
+			end
+			if not found then
+				-- try prefix match
+				for _, c in ipairs(avail) do
+					if c.id:lower():find(vim.pesc(cal_raw:lower()), 1, true) then found = c; break end
+				end
+			end
+			if not found then
+				errs.Calendar = "unknown calendar: " .. cal_raw
+			else
+				calendar_id = found.id
+				calendar_account = found.account
+				calendar_href = found.href
+				calendar_name = found.name
+			end
+		end
+	end
+
+	if next(errs) then
+		return nil, errs
+	end
+
 	return {
 		title = title,
 		date = utils.date_to_str(date),
@@ -243,6 +304,10 @@ local function validate(raw)
 		recurrence = recurrence,
 		attendees = parse_attendees(raw.attendees or ""),
 		teams = teams,
+		calendar = calendar_id,
+		calendar_name = calendar_name,
+		calendar_href = calendar_href,
+		source = calendar_account,
 	}
 end
 

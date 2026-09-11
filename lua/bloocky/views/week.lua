@@ -102,9 +102,12 @@ function M.render(ctx)
 			table.insert(chunks, { "│", "BloockyGrid" })
 			if #all_day[i] > 0 then
 				local block = all_day[i][1]
-				local text = marks.icon(block) .. block.title
+				local badge = require("bloocky.ui").calendar_badge(block)
+				if badge then badge = badge:sub(1, 2) .. " " end
+				badge = badge or ""
+				local text = marks.icon(block) .. badge .. block.title
 				if #all_day[i] > 1 then
-					text = marks.icon(block) .. "×" .. #all_day[i] .. " " .. block.title
+					text = marks.icon(block) .. badge .. "×" .. #all_day[i] .. " " .. block.title
 				end
 				table.insert(chunks, { utils.fit(text, cws[i]), highlights.block_group(block), 100 })
 			else
@@ -168,7 +171,11 @@ function M.render(ctx)
 			local text
 			if block then
 				if block.start_min >= row_s then
-					text = marks.icon(block) .. utils.format_hhmm(block.start_min) .. " " .. block.title
+					local badge = require("bloocky.ui").calendar_badge(block)
+					-- week columns ~9 cols: use 2-char short id to keep time/title visible
+					if badge then badge = badge:sub(1, 2) .. " " end
+					badge = badge or ""
+					text = marks.icon(block) .. badge .. utils.format_hhmm(block.start_min) .. " " .. block.title
 					if block.recurrence then
 						text = text .. " " .. cfg.icons.recurring
 					end

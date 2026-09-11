@@ -96,6 +96,39 @@ function M.secret(account, field)
 	return nil, ("%s: no %s or %s_cmd configured"):format(account.id, field, field)
 end
 
+-- Human-readable, secret-free description of how the secret is configured.
+-- Used in auth failure diagnostics so the user can see *which* secret source
+-- was tried without ever printing the secret value.
+function M.secret_source(account, field)
+	local cmd = account[field .. "_cmd"]
+	if cmd then
+		if type(cmd) == "string" then
+			return field .. "_cmd (shell: " .. cmd .. ")"
+		end
+		if type(cmd) == "table" then
+			local parts = {}
+			for i, p in ipairs(cmd) do
+				if i > 3 then
+					table.insert(parts, "...")
+					break
+				end
+				table.insert(parts, tostring(p))
+			end
+			return field .. "_cmd (" .. table.concat(parts, " ") .. ")"
+		end
+	end
+	if account[field] ~= nil then
+		if account[field] == "" then
+			return field .. ' (empty string)'
+		end
+		return field .. " (plain text, len=" .. tostring(#tostring(account[field])) .. ")"
+	end
+	if field == "password" and account.auth_cmd then
+		return "password via auth_cmd (no password configured, using empty for DavMail)"
+	end
+	return "no " .. field .. " or " .. field .. "_cmd configured"
+end
+
 function M.forget_secrets(account_id)
 	for key in pairs(secrets) do
 		if not account_id or key:match("^" .. vim.pesc(account_id) .. "/") then

@@ -72,7 +72,9 @@ function M.render(ctx)
 				add({ { "    +" .. (#all_day - max_shown) .. " more", "BloockyMore" } })
 				break
 			end
-			local text = "    " .. marks.icon(block) .. " " .. block.title
+			local badge = require("bloocky.ui").calendar_badge(block)
+			badge = badge and ("[" .. badge .. "] ") or ""
+			local text = "    " .. marks.icon(block) .. " " .. badge .. block.title
 			local days = math.ceil((block.duration_min or 1440) / 1440)
 			if days > 1 then
 				text = text .. "  (" .. days .. " days)"
@@ -134,7 +136,10 @@ function M.render(ctx)
 		if block then
 			local text
 			if block.start_min >= row_s then
+				local badge = require("bloocky.ui").calendar_badge(block)
+				badge = badge and ("[" .. badge .. "] ") or ""
 				text = marks.icon(block)
+					.. badge
 					.. utils.format_hhmm(block.start_min)
 					.. "–"
 					.. utils.format_hhmm(block.start_min + block.duration_min)

@@ -14,10 +14,10 @@ local config = require("bloocky.config")
 
 local M = {}
 
-local conflicted, readonly, calendars = {}, {}, {}
+local conflicted, readonly, calendars, calendar_labels, known = {}, {}, {}, {}, {}
 
 function M.refresh()
-	conflicted, readonly, calendars = {}, {}, {}
+	conflicted, readonly, calendars, calendar_labels, known = {}, {}, {}, {}, {}
 
 	local sync = config.options.sync
 	if not (sync and sync.enabled) then
@@ -32,6 +32,8 @@ function M.refresh()
 		conflicted = store.conflicted_ids()
 		readonly = store.readonly_ids()
 		calendars = store.calendar_ids()
+		calendar_labels = store.calendar_labels()
+		known = store.known_calendars()
 	end)
 end
 
@@ -47,6 +49,31 @@ end
 -- a colour instead of each block getting its own from its id.
 function M.calendar_of(block)
 	return block ~= nil and calendars[block.id] or nil
+end
+
+function M.calendar_label(block)
+	if block == nil then return nil end
+	return calendar_labels[block.id]
+end
+
+function M.distinct_calendars()
+	local seen = {}
+	for _, id in pairs(calendars) do seen[id] = true end
+	local n = 0
+	for _ in pairs(seen) do n = n + 1 end
+	return n
+end
+
+function M.known_calendars()
+	return known
+end
+
+function M.needs_badge()
+	-- badge when showing all calendars and >1 distinct calendar exists
+	local ui_ok, ui = pcall(require, "bloocky.ui")
+	local filter = ui_ok and ui.calendar_filter or nil
+	if filter then return false end
+	return M.distinct_calendars() > 1
 end
 
 function M.any_conflicts()

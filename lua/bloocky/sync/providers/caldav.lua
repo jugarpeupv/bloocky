@@ -13,6 +13,26 @@ local M = {}
 
 local NS = 'xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/"'
 
+-- Debug log for auth/sync: written only when sync.debug = true, never includes secrets.
+local function debug_log(msg)
+	local ok, cfg = pcall(require, "bloocky.config")
+	local sync = ok and cfg.options.sync or {}
+	if not (sync.debug) then
+		return
+	end
+	local ok2, http = pcall(require, "bloocky.sync.http")
+	local redacted = ok2 and http.redact(tostring(msg)) or tostring(msg)
+	local path = vim.fn.stdpath("state") .. "/bloocky/debug.log"
+	vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
+	local line = os.date("%Y-%m-%dT%H:%M:%S") .. " " .. redacted .. "\n"
+	local fd = vim.uv.fs_open(path, "a", tonumber("600", 8))
+	if not fd then
+		return
+	end
+	vim.uv.fs_write(fd, line)
+	vim.uv.fs_close(fd)
+end
+
 --------------------------------------------------------------------------
 -- Request bodies
 --------------------------------------------------------------------------
@@ -129,9 +149,22 @@ function M.parse_calendars(body)
 			end
 
 			if supports_events then
+				local display = xml.find_text(response, "displayname")
+				local desc = xml.find_text(response, "calendar-description")
+				-- iCloud sometimes leaves displayname empty or as UUID; prefer description if displayname looks cryptic
+				local name = display and display:match("%S") and vim.trim(display) or nil
+				if not name or name:match("^[A-Z0-9%-]+$") and #name <= 10 then
+					-- fallback to description if it looks more friendly
+					if desc and desc:match("%S") then name = vim.trim(desc) end
+				end
+				name = name or href
+				-- debug: show raw mapping when debug enabled
+				if require("bloocky.config").options.sync.debug then
+					debug_log(("[cal] %s -> displayname=%s desc=%s => name=%s"):format(href, tostring(display), tostring(desc), tostring(name)))
+				end
 				table.insert(out, {
 					href = href,
-					name = xml.find_text(response, "displayname") or href,
+					name = name,
 					ctag = xml.find_text(response, "getctag"),
 					readonly = readonly,
 				})
@@ -170,9 +203,28 @@ end
 -- The seam tests use in place of a live server.
 M.transport = nil
 
+local function secret_diag(account)
+	return account_config.secret_source(account, "password")
+end
+
+local function auth_hint(account)
+	local url = tostring(account.url or "")
+	if url:find("localhost", 1, true) or url:find("127.0.0.1", 1, true) then
+		return "is DavMail running at " .. url .. "? try :BloockySyncAuth " .. account.id .. " to refresh the token; :checkhealth bloocky"
+	end
+	if url:find("icloud.com", 1, true) or url:find("apple.com", 1, true) then
+		return "check app-specific password at appleid.apple.com (2FA required), username must be Apple ID email; if discovery fails set calendar_home per CALENDARS.md#icloud"
+	end
+	return "check username and " .. secret_diag(account) .. "; :checkhealth bloocky"
+end
+
 -- Basic auth for a plain CalDAV server; a bearer token for one behind OAuth
 -- (Google's CalDAV bridge). Either way the credential goes into http.lua's
 -- 0600 config file, never onto the command line.
+local function trim(s)
+	return vim.trim(tostring(s or ""))
+end
+
 local function authorise(account, opts)
 	if account.provider ~= "caldav" or account.bearer_auth then
 		local oauth = require("bloocky.sync.oauth")
@@ -186,9 +238,23 @@ local function authorise(account, opts)
 
 	local password, err = account_config.secret(account, "password")
 	if not password then
-		return err
+		local diag = secret_diag(account)
+		local hint = auth_hint(account)
+		local raw_user = tostring(account.username or "")
+		local user_diag = ("len=%d%s"):format(#raw_user, raw_user ~= trim(raw_user) and " has_ws=true" or "")
+		local msg = ("authentication failed for %s: %s | url=%s user_len=%s secret=%s | hint: %s"):format(
+			account.id,
+			http.redact(tostring(err)),
+			http.redact(account.url or "?"),
+			user_diag,
+			diag,
+			hint
+		)
+		debug_log("[auth] " .. msg .. " raw_user=" .. http.redact(raw_user))
+		return msg
 	end
-	opts.auth = { user = account.username, password = password }
+	-- Trim whitespace (common when username comes from vim.fn.system without gsub)
+	opts.auth = { user = trim(account.username), password = password }
 	return nil
 end
 
@@ -242,16 +308,50 @@ function M.discover(account)
 
 	local err, res = dav(account, "PROPFIND", base, M.propfind_body({ "d:current-user-principal" }), nil, "0")
 	if err then
+		debug_log("[discover] " .. account.id .. " PROPFIND " .. tostring(base) .. " err: " .. tostring(err))
 		return nil, err
 	end
 	if res.status == 401 then
-		return nil, "authentication failed for " .. account.id .. " (check username and password_cmd)"
+		local wa = res.headers and (res.headers["www-authenticate"] or res.headers["WWW-Authenticate"]) or ""
+		local body_snip = http.redact((res.body or ""):sub(1, 300):gsub("%s+", " "))
+		local diag = secret_diag(account)
+		local hint = auth_hint(account)
+		local raw_user = tostring(account.username or "")
+		local user_diag = ("len=%d%s"):format(#raw_user, raw_user ~= trim(raw_user) and " has_ws=true" or "")
+		local msg = ("authentication failed for %s (HTTP 401) at %s | user_len=%s secret=%s | hint: %s"):format(
+			account.id,
+			http.redact(base),
+			user_diag,
+			diag,
+			hint
+		)
+		if wa ~= "" then
+			msg = msg .. " | www-authenticate: " .. http.redact(wa)
+		end
+		if body_snip:match("%S") then
+			msg = msg .. " | body: " .. body_snip
+		end
+		debug_log("[discover 401] " .. msg .. " raw_user=" .. http.redact(raw_user))
+		return nil, msg
 	end
 	if res.status == 503 then
-		return nil, ("server returned 503 for %s (DavMail/MFA session expired - run :BloockySyncAuth %s)"):format(account.id, account.id)
+		local body_snip = http.redact((res.body or ""):sub(1, 300):gsub("%s+", " "))
+		local base_msg = ("server returned 503 for %s (DavMail/MFA session expired - run :BloockySyncAuth %s)"):format(account.id, account.id)
+		local msg = base_msg .. " | url=" .. http.redact(base) .. " secret=" .. secret_diag(account)
+		if body_snip:match("%S") then
+			msg = msg .. " | body: " .. body_snip
+		end
+		debug_log("[discover 503] " .. msg)
+		return nil, msg
 	end
 	if res.status >= 400 then
-		return nil, ("discovery failed at %s (HTTP %d)"):format(base, res.status)
+		local body_snip = http.redact((res.body or ""):sub(1, 500):gsub("%s+", " "))
+		local msg = ("discovery failed at %s (HTTP %d) | user=%s secret=%s"):format(http.redact(base), res.status, http.redact(account.username or "?"), secret_diag(account))
+		if body_snip:match("%S") then
+			msg = msg .. " | body: " .. body_snip
+		end
+		debug_log("[discover] " .. msg)
+		return nil, msg
 	end
 
 	local principal = xml.find_text(xml.find(xml.parse(res.body), "current-user-principal"), "href")
@@ -282,18 +382,36 @@ function M.list_calendars(account, home_url)
 		M.propfind_body({
 			"d:resourcetype",
 			"d:displayname",
+			"c:calendar-description",
 			"cs:getctag",
 			"c:supported-calendar-component-set",
 			"d:current-user-privilege-set",
+			"cs:source", -- some servers expose friendly source
 		}),
 		nil,
 		"1"
 	)
 	if err then
+		debug_log("[list_calendars] " .. account.id .. " err: " .. tostring(err))
 		return nil, err
 	end
 	if res.status >= 400 then
-		return nil, ("could not list calendars (HTTP %d)"):format(res.status)
+		local body_snip = http.redact((res.body or ""):sub(1, 500):gsub("%s+", " "))
+		local msg = ("could not list calendars for %s at %s (HTTP %d) | user=%s secret=%s"):format(
+			account.id,
+			http.redact(home_url),
+			res.status,
+			http.redact(account.username or "?"),
+			secret_diag(account)
+		)
+		if body_snip:match("%S") then
+			msg = msg .. " | body: " .. body_snip
+		end
+		if res.status == 401 then
+			msg = msg .. " | hint: " .. auth_hint(account)
+		end
+		debug_log("[list_calendars " .. res.status .. "] " .. msg)
+		return nil, msg
 	end
 	return M.parse_calendars(res.body), nil
 end

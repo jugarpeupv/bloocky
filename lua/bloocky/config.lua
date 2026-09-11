@@ -96,10 +96,26 @@ M.options = {
 			future_days = 180,
 		},
 
-		conflict = {
+			conflict = {
 			-- How many overwritten local versions to keep for :BloockySyncRestore
 			trail_limit = 50,
 		},
+
+		-- Verbose auth/sync diagnostics written to stdpath("state")/bloocky/debug.log.
+		-- Secrets are never written. Default off.
+		debug = false,
+
+		-- Per-request network budget in seconds (curl --connect-timeout and
+		-- --max-time). A stalled server fails fast instead of hanging the
+		-- sync; the next periodic sync retries. Increase for very slow
+		-- servers or huge sync windows.
+		timeout_s = 15,
+
+		-- Which calendar new blocks go to when you don't pick one (and no
+		-- filter is active). Examples: "izertis" or "icloud/Home".
+		-- Defaults to the default calendar of the first account (see
+		-- calendars[].default per account).
+		default_calendar = nil,
 
 		-- One entry per calendar account.
 		--
@@ -189,6 +205,7 @@ M.options = {
 			detail_vsplit = "<C-v>", -- details in vertical split
 			delete = "x",
 			sync = "s", -- sync now (only bound when sync.enabled)
+			filter_calendar = "f", -- pick calendar filter (all vs single)
 			close = "q",
 		},
 	},

@@ -18,6 +18,8 @@ local ns = vim.api.nvim_create_namespace("bloocky")
 M.view = nil
 M.mode = nil -- "float" | "sidebar" | "buffer"
 M.cursor = nil -- { date = { year, month, day }, min = minutes from midnight }
+M.calendar_filter = nil -- nil = all calendars, else "account" or "account/calendar_name" or "account/href"
+M.calendar_filter_label = nil
 
 local function is_open()
 	if win == nil or buf == nil then
@@ -42,6 +44,181 @@ local function clear_winbar(win_id)
 	if win_id and vim.api.nvim_win_is_valid(win_id) then
 		pcall(vim.api.nvim_set_option_value, "winbar", "", { win = win_id })
 	end
+end
+
+-- Calendar filter: nil = all, else per-account or per-calendar
+function M.available_calendars()
+	local marks = require("bloocky.marks")
+	local list = marks.known_calendars() or {}
+	-- also ensure at least accounts are listed even with no blocks yet
+	local seen = {}
+	for _, c in ipairs(list) do seen[c.id] = true end
+	local cfg_accounts = (config.options.sync or {}).accounts or {}
+	for _, acc in ipairs(cfg_accounts) do
+		if not seen[acc.id] then
+			table.insert(list, { account = acc.id, href = acc.url or "", name = acc.id, id = acc.id })
+		end
+	end
+	table.sort(list, function(a, b) return a.id < b.id end)
+	return list
+end
+
+function M.default_calendar()
+	local sync = config.options.sync or {}
+	if sync.default_calendar and sync.default_calendar ~= "" then
+		return sync.default_calendar
+	end
+	-- respect per-calendar default flag
+	for _, acc in ipairs(sync.accounts or {}) do
+		for _, cal in ipairs(acc.calendars or {}) do
+			if cal.default then
+				return acc.id .. "/" .. (cal.name or cal.href or acc.id)
+			end
+		end
+	end
+	-- fallback: first account (user config order)
+	if sync.accounts and sync.accounts[1] and sync.accounts[1].id then
+		return sync.accounts[1].id
+	end
+	return nil
+end
+
+function M.set_calendar_filter(filter, label)
+	if filter == "" then filter = nil end
+	M.calendar_filter = filter
+	M.calendar_filter_label = label or filter
+	if is_open() then M.render() end
+end
+
+function M.clear_calendar_filter()
+	M.set_calendar_filter(nil, nil)
+end
+
+local function ui_select(items, opts, on_choice)
+	-- Prefer snacks.nvim picker if available
+	local ok_snacks, snacks = pcall(require, "snacks")
+	if ok_snacks and snacks.picker and snacks.picker.select then
+		local ok = pcall(snacks.picker.select, items, opts, on_choice)
+		if ok then return end
+	end
+	local ok_p, picker = pcall(require, "snacks.picker")
+	if ok_p and picker and picker.select then
+		local ok = pcall(picker.select, items, opts, on_choice)
+		if ok then return end
+	end
+	-- Try telescope
+	local has_tel, pickers = pcall(require, "telescope.pickers")
+	if has_tel then
+		local ok_f, finders = pcall(require, "telescope.finders")
+		local ok_c, conf = pcall(require, "telescope.config")
+		local ok_a, actions = pcall(require, "telescope.actions")
+		local ok_s, action_state = pcall(require, "telescope.actions.state")
+		if ok_f and ok_c and ok_a and ok_s then
+			pickers.new({}, {
+				prompt_title = opts.prompt or "Select",
+				finder = finders.new_table({
+					results = items,
+					entry_maker = function(entry)
+						local display = opts.format_item and opts.format_item(entry) or tostring(entry.label or entry.id or entry)
+						return { value = entry, display = display, ordinal = display }
+					end,
+				}),
+				sorter = conf.values.generic_sorter({}),
+				attach_mappings = function(bufnr)
+					actions.select_default:replace(function()
+						actions.close(bufnr)
+						local sel = action_state.get_selected_entry()
+						on_choice(sel and sel.value or nil)
+					end)
+					return true
+				end,
+			}):find()
+			return
+		end
+	end
+	vim.ui.select(items, opts, on_choice)
+end
+
+function M.pick_calendar()
+	local items = { { id = nil, label = "All calendars", desc = "show every calendar", name = "All" } }
+	for _, c in ipairs(M.available_calendars()) do
+		local friendly = c.name ~= c.account and c.name or c.id
+		table.insert(items, { id = c.id, href = c.href, account = c.account, label = friendly, desc = c.account, name = c.name })
+	end
+	ui_select(items, {
+		prompt = "Calendar filter",
+		format_item = function(it)
+			if it.id == nil then return it.label end
+			if it.label == it.desc then return it.label end
+			return it.label .. " (" .. it.desc .. ")"
+		end,
+	}, function(choice)
+		if not choice then return end
+		if choice.id == nil then
+			M.clear_calendar_filter()
+			vim.notify("Bloocky: showing all calendars", vim.log.levels.INFO)
+		else
+			M.set_calendar_filter(choice.id, choice.label)
+			vim.notify("Bloocky: filter → " .. choice.label, vim.log.levels.INFO)
+		end
+	end)
+end
+
+-- internal helper used by form.lua calendar field <CR> picker
+-- Whole-account entries ("icloud (all)") are excluded: creation needs a
+-- concrete calendar. They only make sense in the filter picker (f).
+function M._pick_calendar_for_form(buf, win, on_choice)
+	local avail = M.available_calendars()
+	if #avail == 0 then
+		vim.notify("Bloocky: no calendars available (sync first)", vim.log.levels.WARN)
+		return
+	end
+	local items = {}
+	for _, c in ipairs(avail) do
+		if c.id ~= c.account then table.insert(items, c) end
+	end
+	if #items == 0 then
+		-- nothing concrete known yet (no sync): fall back to whole-account
+		for _, c in ipairs(avail) do table.insert(items, c) end
+	end
+	ui_select(items, {
+		prompt = "Pick calendar",
+		format_item = function(it)
+			-- whole-account entry (name == account): show as account-wide target
+			if it.name == it.account then return it.account .. "  (all)" end
+			return it.name .. "  [" .. it.account .. "]"
+		end,
+	}, function(choice)
+		if not choice then return end
+		if on_choice then on_choice(choice.id) end
+	end)
+end
+
+local function calendar_matches(block)
+	if not M.calendar_filter then return true end
+	local cal = require("bloocky.marks").calendar_of(block)
+	if not cal then return false end
+	-- filter may be "account" prefix or full "account/calendar_name" id
+	if cal == M.calendar_filter then return true end
+	if cal:find("^" .. vim.pesc(M.calendar_filter) .. "/") then return true end
+	-- also match via label: e.g. filter = "izertis/Work" should match href-based cal
+	local label = require("bloocky.marks").calendar_label(block)
+	if label and label == M.calendar_filter then return true end
+	if label and label:find("^" .. vim.pesc(M.calendar_filter) .. "/") then return true end
+	return false
+end
+
+function M.calendar_badge(block)
+	if not block then return nil end
+	-- when filtered, badge is redundant
+	if M.calendar_filter then return nil end
+	if not require("bloocky.marks").needs_badge() then return nil end
+	local label = require("bloocky.marks").calendar_label(block)
+	if label then
+		-- show only account id (e.g. "icloud" not "icloud/AAx...") to keep columns readable
+		return label:match("^[^/]+") or label
+	end
+	return block.source and block.source ~= "local" and block.source or nil
 end
 
 -- Called by detail view when it replaces the calendar window's buffer
@@ -158,8 +335,15 @@ local function sync_enabled()
 	return sync and sync.enabled and #(sync.accounts or {}) > 0
 end
 
+local function filtered_account()
+	if not M.calendar_filter then return nil end
+	return M.calendar_filter:match("^[^/]+")
+end
+
 -- Sync now, showing the indicator while it runs and redrawing after.
 -- `quiet` is for syncs the user did not ask for by hand.
+-- When a calendar filter is active (e.g. Bloocky week izertis), :e and periodic
+-- syncs limit themselves to that account so we don't refresh every calendar.
 function M.sync(opts)
 	opts = opts or {}
 	if not sync_enabled() then
@@ -169,8 +353,13 @@ function M.sync(opts)
 		return
 	end
 
+	local target = opts.account or filtered_account()
+	if target then
+		-- label reflects the filter so spinner isn't misleading
+		opts.label = opts.label or ("syncing " .. target)
+	end
 	M.show_status(opts.label or "syncing")
-	require("bloocky.sync").run(nil, function(reports)
+	require("bloocky.sync").run(target, function(reports)
 		M.hide_status()
 		M.render()
 		if opts.on_done then
@@ -357,14 +546,21 @@ end
 local function footer_text(width)
 	local km = config.options.keymaps.calendar
 	local sync_hint = (km.sync and sync_enabled()) and (" · " .. km.sync .. " sync") or ""
+	local filter_hint = ""
+	pcall(function()
+		if require("bloocky.marks").distinct_calendars() > 1 or M.calendar_filter then
+			filter_hint = " · " .. (km.filter_calendar or "f") .. " filter"
+		end
+	end)
 	local full = string.format(
-		" %s add · %s edit · %s delete · %s view · %s today%s · %s close ",
+		" %s add · %s edit · %s delete · %s view · %s today%s%s · %s close ",
 		km.add or "-",
 		km.edit or "-",
 		km.delete or "-",
 		km.cycle_view or "-",
 		km.today or "-",
 		sync_hint,
+		filter_hint,
 		km.close or "-"
 	)
 	if width and utils.dw(full) > width then
@@ -392,6 +588,14 @@ function M.render()
 		config = config.options,
 	}
 	local lines, hls, meta = views[M.view].render(ctx)
+
+	-- calendar filter badge in title
+	if M.calendar_filter then
+		local label = M.calendar_filter_label or M.calendar_filter
+		meta.title = (meta.title or " Bloocky "):gsub("%s+$", "") .. " [" .. label .. "] "
+	elseif require("bloocky.marks").distinct_calendars() > 1 then
+		meta.title = (meta.title or " Bloocky "):gsub("%s+$", "") .. " — All "
+	end
 
 	if M.mode == "sidebar" or M.mode == "buffer" then
 		-- A split / buffer cannot carry a float title, so the winbar stands in for it
@@ -665,6 +869,7 @@ local function setup_keymaps()
 			M.sync()
 		end)
 	end
+	map(km.filter_calendar or "f", M.pick_calendar)
 	map(km.close, M.close)
 	if M.mode == "float" then
 		-- In sidebar/buffer <Esc> is too eager: they are windows you keep around
@@ -766,6 +971,14 @@ function M.open(opts)
 	opts = normalize(opts)
 	highlights.setup()
 	state.ensure_loaded()
+
+	if opts.calendar_filter ~= nil then
+		M.calendar_filter = opts.calendar_filter ~= "" and opts.calendar_filter or nil
+		M.calendar_filter_label = opts.calendar_filter_label or M.calendar_filter
+	elseif opts.calendar ~= nil then
+		M.calendar_filter = opts.calendar ~= "" and opts.calendar or nil
+		M.calendar_filter_label = opts.calendar_label or M.calendar_filter
+	end
 
 	local raw_mode = opts.mode or (is_open() and M.mode) or config.options.window.mode or "float"
 	local mode = resolve_mode(raw_mode)

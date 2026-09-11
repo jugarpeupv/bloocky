@@ -31,13 +31,67 @@ function M.setup(opts)
 		return { "day", "week", "month" }
 	end
 
+	local function parse_bloocky_args(str)
+		local parts = vim.split(vim.trim(str or ""), "%s+", { trimempty = true })
+		local view, cal
+		if #parts >= 1 and vim.tbl_contains({ "day", "week", "month" }, parts[1]) then
+			view = parts[1]
+			if #parts >= 2 then cal = table.concat(vim.list_slice(parts, 2), " ") end
+		elseif #parts >= 1 and parts[1] ~= "" then
+			-- allow :Bloocky <calendar> (default view)
+			cal = table.concat(parts, " ")
+		end
+		return view, cal
+	end
+
 	vim.api.nvim_create_user_command("Bloocky", function(cmd)
-		local view = cmd.args ~= "" and cmd.args or nil
-		require("bloocky.ui").open(view)
+		local view, cal = parse_bloocky_args(cmd.args)
+		if cal and cal ~= "" then
+			if cal == "all" then
+				require("bloocky.ui").clear_calendar_filter()
+			else
+				require("bloocky.ui").set_calendar_filter(cal, cal)
+			end
+		end
+		if view or cal then
+			require("bloocky.ui").open(view and { view = view } or nil)
+		else
+			require("bloocky.ui").open(nil)
+		end
+	end, {
+		nargs = "*",
+		complete = function(arglead, cmdline, _)
+			-- complete view first, then calendar ids
+			local parts = vim.split(cmdline, "%s+")
+			if #parts <= 2 then return views() end
+			local cals = {}
+			for _, c in ipairs(require("bloocky.ui").available_calendars()) do table.insert(cals, c.id) end
+			table.insert(cals, "all")
+			return cals
+		end,
+		desc = "Open the Bloocky calendar (optional view and calendar filter)",
+	})
+
+	vim.api.nvim_create_user_command("BloockyCalendar", function(cmd)
+		local arg = vim.trim(cmd.args or "")
+		if arg == "" or arg == "all" then
+			require("bloocky.ui").clear_calendar_filter()
+			vim.notify("Bloocky: showing all calendars", vim.log.levels.INFO)
+		elseif arg == "pick" then
+			require("bloocky.ui").pick_calendar()
+		else
+			require("bloocky.ui").set_calendar_filter(arg, arg)
+			vim.notify("Bloocky: filter → " .. arg, vim.log.levels.INFO)
+		end
+		if require("bloocky.ui").is_open() then require("bloocky.ui").render() end
 	end, {
 		nargs = "?",
-		complete = views,
-		desc = "Open the Bloocky calendar",
+		complete = function()
+			local out = { "all", "pick" }
+			for _, c in ipairs(require("bloocky.ui").available_calendars()) do table.insert(out, c.id) end
+			return out
+		end,
+		desc = "Set calendar filter (all, pick, or account[/calendar])",
 	})
 
 	vim.api.nvim_create_user_command("BloockyToggle", function()

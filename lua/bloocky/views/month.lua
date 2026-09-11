@@ -112,8 +112,10 @@ function M.render(ctx)
 			for _, block in ipairs(state.blocks_for_date(d)) do
 				-- An all-day block has a date, not a time, so showing "00:00"
 				-- would be inventing one.
-				local label = block.all_day and (marks.icon(block) .. " " .. block.title)
-					or (marks.icon(block) .. utils.format_hhmm(block.start_min) .. " " .. block.title)
+				local badge = require("bloocky.ui").calendar_badge(block)
+				badge = badge and ("[" .. badge .. "] ") or ""
+				local label = block.all_day and (marks.icon(block) .. " " .. badge .. block.title)
+					or (marks.icon(block) .. badge .. utils.format_hhmm(block.start_min) .. " " .. block.title)
 				table.insert(entries, { text = label, grp = highlights.block_group(block), prio = 100 })
 			end
 			for _, todo in ipairs(dooing.tasks_for_date(d_str)) do

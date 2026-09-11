@@ -38,6 +38,27 @@ function M.render(opts)
 		attendees_str = table.concat(parts, ", ")
 	end
 	local notes_str = block and (block.notes or "") or ""
+	-- Calendar field for creation: show current calendar or filter
+	local calendar_str = ""
+	do
+		if block then
+			local ok, lab = pcall(function() return require("bloocky.marks").calendar_label(block) end)
+			calendar_str = (ok and lab) and lab or (block.calendar or block.source or "")
+		else
+				local ok, ui = pcall(require, "bloocky.ui")
+			if ok and ui.calendar_filter then
+				calendar_str = ui.calendar_filter
+			else
+				local ok2, def = pcall(function() return require("bloocky.ui").default_calendar() end)
+				if ok2 and def then
+					calendar_str = def
+				else
+					local sync = config.options.sync or {}
+					if sync.accounts and sync.accounts[1] then calendar_str = sync.accounts[1].id end
+				end
+			end
+		end
+	end
 
 	local lines = {}
 	table.insert(lines, "# " .. (title ~= "" and title or "New Event"))
@@ -49,6 +70,7 @@ function M.render(opts)
 	table.insert(lines, "- **Days:** " .. days_str)
 	table.insert(lines, "- **Until:** " .. until_str)
 	table.insert(lines, "- **Teams:** " .. (block and block.teams and "yes" or "no"))
+	table.insert(lines, "- **Calendar:** " .. calendar_str)
 	table.insert(lines, "- **Attendees:** " .. attendees_str)
 	table.insert(lines, "")
 	table.insert(lines, "## Notes")
@@ -60,7 +82,7 @@ function M.render(opts)
 	end
 	table.insert(lines, "")
 	table.insert(lines, "---")
-	table.insert(lines, "_`:w` or `<C-s>` save | `q` cancel_")
+	table.insert(lines, "_`:w` or `<C-s>` save | `<CR>` on Calendar to pick | `q` cancel_")
 
 	return lines
 end
@@ -76,6 +98,7 @@ function M.parse(lines)
 		days = "",
 		["until"] = "",
 		attendees = "",
+		calendar = "",
 		notes = "",
 	}
 	local in_notes = false
@@ -123,6 +146,8 @@ function M.parse(lines)
 					if v ~= "" or raw["until"] == "" then raw["until"] = v end
 				elseif k == "teams" or k == "online" then
 					if v ~= "" or raw.teams == nil then raw.teams = v end
+				elseif k == "calendar" then
+					if v ~= "" or raw.calendar == "" then raw.calendar = v end
 				elseif k == "attendees" or k == "attendee" or k == "attendants" then
 					if v ~= "" or raw.attendees == "" then raw.attendees = v end
 				end
@@ -213,6 +238,43 @@ function M.open(opts)
 	end, kopts)
 	vim.keymap.set("n", "q", function()
 		close()
+	end, kopts)
+
+	-- Pick calendar on <CR> when on Calendar line
+	local function pick_calendar_for_form()
+		local ok_ui, ui = pcall(require, "bloocky.ui")
+		if not (ok_ui and ui._pick_calendar_for_form) then
+			vim.notify("Bloocky: calendar picker not available", vim.log.levels.WARN)
+			return
+		end
+		ui._pick_calendar_for_form(buf, win, function(choice_id)
+			local cur = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+			for idx, l in ipairs(cur) do
+				if l:lower():find("calendar") and l:find(":") then
+					local new_line = "- **Calendar:** " .. choice_id
+					pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = buf })
+					vim.api.nvim_buf_set_lines(buf, idx - 1, idx, false, { new_line })
+					pcall(vim.api.nvim_set_option_value, "modified", true, { buf = buf })
+					pcall(vim.api.nvim_win_set_cursor, win, { idx, 0 })
+					break
+				end
+			end
+		end)
+	end
+
+	vim.keymap.set("n", "<CR>", function()
+		local cur_line = 1
+		if vim.api.nvim_win_is_valid(win) then
+			local ok, pos = pcall(vim.api.nvim_win_get_cursor, win)
+			if ok then cur_line = pos[1] end
+		end
+		local line = vim.api.nvim_buf_get_lines(buf, cur_line - 1, cur_line, false)[1] or ""
+		if line:lower():find("calendar") then
+			pick_calendar_for_form()
+		else
+			-- allow normal <CR> to not be swallowed: move down or insert?
+			-- in normal mode, <CR> is not needed; just stay
+		end
 	end, kopts)
 
 	-- Position cursor on title or first field

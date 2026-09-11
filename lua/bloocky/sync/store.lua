@@ -333,7 +333,7 @@ function M.acknowledge_conflicts()
 	return changed
 end
 
--- Which calendar each synced block belongs to.
+-- Which calendar each synced block belongs to (href-based, stable for coloring).
 function M.calendar_ids()
 	M.ensure_loaded()
 	local out = {}
@@ -342,6 +342,103 @@ function M.calendar_ids()
 			out[block_id] = mapping.account .. "/" .. mapping.calendar
 		end
 	end
+	return out
+end
+
+-- Human label for each block: "account/Calendar Name" or "account"
+function M.calendar_labels()
+	M.ensure_loaded()
+	local out = {}
+	for block_id, mapping in pairs(data.mappings) do
+		if mapping.account then
+			if mapping.calendar_name and mapping.calendar_name ~= "" then
+				out[block_id] = mapping.account .. "/" .. mapping.calendar_name
+			elseif mapping.calendar then
+				-- fallback: last path segment
+				local name = mapping.calendar:match("([^/]+)/?$") or mapping.calendar
+				out[block_id] = mapping.account .. "/" .. name
+			else
+				out[block_id] = mapping.account
+			end
+		end
+	end
+	return out
+end
+
+-- Backfill friendly display names onto existing mappings after discovery.
+-- Mappings created before calendar_name existed (or before the server
+-- returned a displayname) keep calendar_name=nil and fall back to the raw
+-- href segment (UUID). Refreshing here means one sync heals all pickers,
+-- badges and detail views without waiting for every event to change.
+local function norm_href(href)
+	if not href then return nil end
+	local path = tostring(href):gsub("^%a[%w%+%.%-]*://[^/]+", "")
+	path = path:gsub("/+$", "")
+	if path == "" then return nil end
+	return path
+end
+
+function M.refresh_calendar_names(account_id, calendars)
+	M.ensure_loaded()
+	if not account_id or not calendars then return 0 end
+	local by_href = {}
+	for _, cal in ipairs(calendars) do
+		local n = norm_href(cal.href)
+		if n and cal.name and cal.name ~= "" then
+			by_href[n] = cal.name
+		end
+	end
+	if not next(by_href) then return 0 end
+	local updated = 0
+	for _, mapping in pairs(data.mappings) do
+		if mapping.account == account_id and mapping.calendar then
+			local n = norm_href(mapping.calendar)
+			local friendly = n and by_href[n]
+			if friendly and mapping.calendar_name ~= friendly then
+				mapping.calendar_name = friendly
+				updated = updated + 1
+			end
+		end
+	end
+	if updated > 0 then M.save() end
+	return updated
+end
+
+-- Unique calendar identifiers present in store (account/href), for picker.
+function M.known_calendars()
+	M.ensure_loaded()
+	local seen, out = {}, {}
+	for _, mapping in pairs(data.mappings) do
+		if mapping.account and mapping.calendar then
+			local key = mapping.account .. "\0" .. mapping.calendar
+			if not seen[key] then
+				seen[key] = true
+				table.insert(out, {
+					account = mapping.account,
+					href = mapping.calendar,
+					name = mapping.calendar_name or mapping.calendar:match("([^/]+)/?$") or mapping.calendar,
+					id = mapping.account .. "/" .. (mapping.calendar_name or mapping.calendar:match("([^/]+)/?$") or mapping.calendar),
+				})
+			end
+		end
+	end
+	-- include configured calendars that have no blocks yet (so filter is discoverable)
+	local cfg_ok, cfg = pcall(require, "bloocky.config")
+	if cfg_ok then
+		for _, acc in ipairs((cfg.options.sync or {}).accounts or {}) do
+			for _, cal in ipairs(acc.calendars or {}) do
+				local name = cal.name or cal.href
+				if name then
+					local key = acc.id .. "\0" .. (cal.href or name)
+					if not seen[key] then
+						seen[key] = true
+						table.insert(out, { account = acc.id, href = cal.href or name, name = name, id = acc.id .. "/" .. name })
+					end
+				end
+			end
+		end
+	end
+	table.sort(out, function(a, b) return a.id < b.id end)
 	return out
 end
 

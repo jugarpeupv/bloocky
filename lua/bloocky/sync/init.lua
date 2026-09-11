@@ -26,6 +26,23 @@ local last_errors = {}
 -- Config warnings already shown this session.
 local warned = {}
 
+local function debug_log(msg)
+	local sync = config.options.sync or {}
+	if not sync.debug then
+		return
+	end
+	local http = require("bloocky.sync.http")
+	local path = vim.fn.stdpath("state") .. "/bloocky/debug.log"
+	vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
+	local line = os.date("%Y-%m-%dT%H:%M:%S") .. " " .. http.redact(tostring(msg)) .. "\n"
+	local fd = vim.uv.fs_open(path, "a", tonumber("600", 8))
+	if not fd then
+		return
+	end
+	vim.uv.fs_write(fd, line)
+	vim.uv.fs_close(fd)
+end
+
 --------------------------------------------------------------------------
 -- Setup
 --------------------------------------------------------------------------
@@ -243,18 +260,35 @@ local function push_updates(account, report)
 	return changes
 end
 
-local function push_creations(account, calendars, changes, report)
-	local provider = providers.for_account(account)
-	local target = nil
-	for _, calendar in ipairs(calendars) do
-		if calendar.mode == "rw" and (calendar.default or not target) then
-			target = calendar
-			if calendar.default then
-				break
+local function pick_target(account, calendars, block)
+	-- if block has an explicit calendar (e.g. "izertis/Work" or href), try to honour it
+	if block and (block.calendar or block.calendar_href or block.calendar_name) then
+		for _, cal in ipairs(calendars) do
+			if cal.mode ~= "rw" then goto continue end
+			local cid = account.id .. "/" .. (cal.name or cal.href or "")
+			if block.calendar and (block.calendar == cid or block.calendar == cal.name or block.calendar == cal.href or block.calendar == account.id) then
+				return cal
 			end
+			if block.calendar_name and cal.name == block.calendar_name then return cal end
+			if block.calendar_href and cal.href == block.calendar_href then return cal end
+			if block.calendar and block.calendar:lower() == cid:lower() then return cal end
+			::continue::
 		end
 	end
-	if not target then
+	-- fallback: default calendar of the account
+	for _, calendar in ipairs(calendars) do
+		if calendar.mode == "rw" and calendar.default then return calendar end
+	end
+	for _, calendar in ipairs(calendars) do
+		if calendar.mode == "rw" then return calendar end
+	end
+	return nil
+end
+
+local function push_creations(account, calendars, changes, report)
+	local provider = providers.for_account(account)
+	local default_target = pick_target(account, calendars, nil)
+	if not default_target then
 		return
 	end
 
@@ -263,6 +297,7 @@ local function push_creations(account, calendars, changes, report)
 		-- another account must not be duplicated into this one.
 		local source = block.source or "local"
 		if source == account.id or (source == "local" and account.is_default) then
+			local target = pick_target(account, calendars, block) or default_target
 			local handled_by_teams = false
 			if block.teams and (account.auth_cmd or account.davmail_token_file) then
 				local ok, res, res_err = pcall(function()
@@ -275,6 +310,7 @@ local function push_creations(account, calendars, changes, report)
 					store.mark_synced(block, {
 						account = account.id,
 						calendar = target.href,
+						calendar_name = target.name,
 						uid = res.iCalUId or res.id,
 						graph_id = res.id,
 						teams = true,
@@ -302,6 +338,7 @@ local function push_creations(account, calendars, changes, report)
 					store.mark_synced(block, {
 						account = account.id,
 						calendar = target.href,
+						calendar_name = target.name,
 						uid = result.uid,
 						href = result.href,
 						etag = result.etag,
@@ -390,6 +427,7 @@ local function apply_remote(account, calendar, response, report)
 		store.mark_synced(existing, {
 			account = account.id,
 			calendar = calendar.href,
+			calendar_name = calendar.name,
 			uid = event.uid,
 			href = response.href,
 			etag = response.etag,
@@ -409,6 +447,7 @@ local function apply_remote(account, calendar, response, report)
 	store.mark_synced(block, {
 		account = account.id,
 		calendar = calendar.href,
+		calendar_name = calendar.name,
 		uid = event.uid,
 		href = response.href,
 		etag = response.etag,
@@ -431,7 +470,11 @@ local function pull_calendar(account, calendar, report)
 	local result, err = provider.fetch(account, calendar, cursor, win)
 
 	if err then
-		table.insert(report.errors, ("%s: %s"):format(calendar.name, err))
+		local msg = ("%s: %s"):format(calendar.name, err)
+		if tostring(err):find("timed out") then
+			msg = msg .. " (transient stall — next sync retries; tune sync.timeout_s)"
+		end
+		table.insert(report.errors, msg)
 		return
 	end
 
@@ -524,6 +567,11 @@ function M.notify_report(report, opts)
 		return
 	end
 
+	-- Persist for debug + status visibility even when throttled.
+	if #report.errors > 0 or #report.conflicts > 0 then
+		debug_log(("report %s: %s"):format(report.account, table.concat(report.errors, " | ")))
+	end
+
 	-- An unreachable server is one piece of news, not one every interval. Say
 	-- it once, then stay quiet until it changes or clears. Anything else worth
 	-- reporting (a conflict, an actual change) still gets through.
@@ -613,6 +661,12 @@ function M.sync_account(account, done, retrying)
 			table.insert(report.errors, "no usable calendars")
 			return
 		end
+
+		-- Heal stale calendar_name=nil mappings (created before displayname
+		-- support) so pickers/badges/detail show "Trabajo" not UUIDs.
+		pcall(function()
+			store.refresh_calendar_names(account.id, calendars)
+		end)
 
 		-- Push first. See the note at the top of this file.
 		push_deletions(account, calendars, report)

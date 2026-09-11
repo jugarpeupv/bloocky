@@ -134,15 +134,30 @@ local function quote(value)
 	return '"' .. escaped .. '"'
 end
 
+-- Effective per-request budget in ms. Explicit opts.timeout wins, then
+-- sync.timeout_s from the user config, then the 30s historical default.
+function M.effective_timeout_ms(opts)
+	if opts and type(opts.timeout) == "number" and opts.timeout > 0 then
+		return math.floor(opts.timeout)
+	end
+	local ok, cfg = pcall(require, "bloocky.config")
+	local s = ok and cfg.options.sync and cfg.options.sync.timeout_s
+	if type(s) == "number" and s > 0 then
+		return math.floor(s * 1000)
+	end
+	return 30000
+end
+
 local function build(opts)
+	local timeout_s = tostring(math.max(1, math.floor(M.effective_timeout_ms(opts) / 1000)))
 	local args = {
 		"curl",
 		"--silent",
 		"--show-error",
 		"--connect-timeout",
-		tostring(math.floor((opts.timeout or 30000) / 1000)),
+		timeout_s,
 		"--max-time",
-		tostring(math.floor((opts.timeout or 30000) / 1000)),
+		timeout_s,
 	}
 
 	-- Secrets go in the config file, everything else on the command line.

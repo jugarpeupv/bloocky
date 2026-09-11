@@ -92,6 +92,9 @@ function M.add_block(fields)
 		organizer = fields.organizer, -- nil | { name, email }
 		location = fields.location, -- nil | string
 		teams = fields.teams or nil, -- nil | boolean (online Teams meeting)
+		calendar = fields.calendar, -- nil or "account/calendar" id; used for creation target
+		calendar_name = fields.calendar_name,
+		calendar_href = fields.calendar_href,
 		created_at = os.time(),
 		updated_at = os.time(), -- bumped on every edit; sync reads it
 		source = fields.source or "local", -- "local" or the sync account it came from
@@ -127,6 +130,19 @@ function M.update_block(id, fields)
 			end
 			if fields.teams ~= nil then
 				block.teams = fields.teams
+			end
+			-- calendar selection: allow moving via edit (will be handled as delete+create if different account)
+			if fields.calendar ~= nil then
+				block.calendar = fields.calendar
+			end
+			if fields.calendar_name ~= nil then
+				block.calendar_name = fields.calendar_name
+			end
+			if fields.calendar_href ~= nil then
+				block.calendar_href = fields.calendar_href
+			end
+			if fields.source ~= nil then
+				block.source = fields.source
 			end
 			block.updated_at = os.time()
 			block.source = block.source or "local" -- backfill for pre-sync blocks
@@ -272,6 +288,22 @@ local function occurs_on(block, date_str, wd, date)
 	return false
 end
 
+local function calendar_visible(block)
+	local ok, ui = pcall(require, "bloocky.ui")
+	if not ok or not ui.calendar_filter then return true end
+	local filter = ui.calendar_filter
+	local ok2, marks = pcall(require, "bloocky.marks")
+	if not ok2 then return true end
+	local cal = marks.calendar_of(block)
+	if not cal then return false end -- locals hidden when filtering to a remote calendar
+	if cal == filter then return true end
+	if cal:find("^" .. vim.pesc(filter) .. "/") then return true end
+	local label = marks.calendar_label(block)
+	if label and label == filter then return true end
+	if label and label:find("^" .. vim.pesc(filter) .. "/") then return true end
+	return false
+end
+
 -- All blocks covering a date. All-day blocks come first — they are drawn above
 -- the hour grid, not in it — and the rest sort by start time.
 function M.blocks_for_date(date)
@@ -280,7 +312,7 @@ function M.blocks_for_date(date)
 	local wd = utils.wday(date)
 	local out = {}
 	for _, block in ipairs(M.blocks) do
-		if occurs_on(block, date_str, wd, date) then
+		if occurs_on(block, date_str, wd, date) and calendar_visible(block) then
 			table.insert(out, block)
 		end
 	end
