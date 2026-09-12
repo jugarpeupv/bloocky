@@ -79,7 +79,7 @@ A timeblocking calendar for Neovim. Plan your day by placing time blocks on a ca
 
     -- Visible hour range in the day and week views
     hours = {
-        start = 5,     -- first hour shown (05:00)
+        start = 6,     -- first hour shown (06:00)
         ["end"] = 22,  -- last hour shown (22:00)
     },
 

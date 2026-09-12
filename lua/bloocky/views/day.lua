@@ -32,11 +32,15 @@ end
 
 function M.render(ctx)
 	local cfg = ctx.config
-	local gutter = 8 -- " 05:00 │"
+	local gutter = 8 -- " 06:00 │"
 	local cwidth = ctx.width - gutter
 
 	local lines, hls = {}, {}
 	local meta = { width = ctx.width }
+	-- Reverse map for native cursor moves (arrows/mouse): grid line -> slot.
+	-- Single day column, so only the slot matters; ui.lua keeps M.cursor.min
+	-- in sync from it.
+	meta.slots = {}
 
 	local function push(chunks)
 		local line, line_hls, spans = utils.compose(chunks)
@@ -136,18 +140,11 @@ function M.render(ctx)
 		if block then
 			local text
 			if block.start_min >= row_s then
+				-- Title only, no clock time: the row position already shows
+				-- when it is, like the week view.
 				local badge = require("bloocky.ui").calendar_badge(block)
 				badge = badge and ("[" .. badge .. "] ") or ""
-				text = marks.icon(block)
-					.. badge
-					.. utils.format_hhmm(block.start_min)
-					.. "–"
-					.. utils.format_hhmm(block.start_min + block.duration_min)
-					.. " "
-					.. block.title
-					.. " ("
-					.. utils.format_duration(block.duration_min)
-					.. ")"
+				text = marks.icon(block) .. badge .. block.title
 				if block.recurrence then
 					text = text .. " " .. cfg.icons.recurring
 				end
@@ -178,6 +175,7 @@ function M.render(ctx)
 				{ "│", "BloockyGrid" },
 				body,
 			})
+			meta.slots[lnum] = { s = row_s, e = row_e }
 			if on_cursor then
 				local span = spans[3]
 				table.insert(hls, { line = lnum, s = span.s, e = span.e, group = "BloockyCursor", prio = 200 })
@@ -198,7 +196,7 @@ function M.render(ctx)
 				push({
 					{ string.rep(" ", gutter - 1) },
 					{ "│", "BloockyGrid" },
-					{ string.rep("┄", cwidth), "BloockyGrid" },
+					{ string.rep("┄", cwidth), "BloockyGridDim" },
 				})
 			end
 		end

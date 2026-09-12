@@ -1,7 +1,7 @@
--- Brokened events: a gateway that aborts a body-carrying REPORT mid-stream
+-- Broken events: a gateway that aborts a body-carrying REPORT mid-stream
 -- (DavMail + an iCal line its parser rejects, surfacing as curl 56) must not
 -- take down the whole calendar. Multiget bisects transport failures to
--- isolate the brokened href; initial fetch falls back to etag-only
+-- isolate the broken href; initial fetch falls back to etag-only
 -- enumeration plus a client-side window filter.
 local caldav = require("bloocky.sync.providers.caldav")
 local config = require("bloocky.config")
@@ -104,9 +104,9 @@ local function run_async(fn)
 	return result
 end
 
-describe("brokened events", function()
+describe("broken events", function()
 	describe("multiget", function()
-		it("isolates a brokened href and returns the rest", function()
+		it("isolates a broken href and returns the rest", function()
 			caldav.transport = broken_transport(true)
 			local r = run_async(function()
 				return caldav.multiget(ACCOUNT, CAL, { "/dav/home/work/a.ics", "/dav/home/work/broken.ics", "/dav/home/work/b.ics" })

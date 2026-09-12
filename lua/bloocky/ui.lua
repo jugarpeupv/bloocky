@@ -13,6 +13,7 @@ local views = {
 local view_order = { "day", "week", "month" }
 
 local buf, win = nil, nil
+local last_grid = nil -- { view, slots, day_cols, slot_days } from the last render
 local ns = vim.api.nvim_create_namespace("bloocky")
 
 M.view = nil
@@ -540,7 +541,8 @@ local function clamp_cursor()
 	local h0 = config.options.hours.start
 	local h1 = config.options.hours["end"]
 	local min = M.cursor.min or h0 * 60
-	M.cursor.min = math.min(math.max(min, h0 * 60), (h1 - 1) * 60)
+	-- last grid sub-row starts 15 min before the end of the visible range
+	M.cursor.min = math.min(math.max(min, h0 * 60), h1 * 60 - 15)
 end
 
 local function footer_text(width)
@@ -644,6 +646,120 @@ function M.render()
 	end
 
 	pcall(vim.api.nvim_win_set_cursor, win, { meta.cursor_line or 1, 0 })
+
+	-- Reverse map for native cursor moves (arrows/mouse): grid line -> slot.
+	last_grid = { view = M.view, slots = meta.slots, day_cols = meta.day_cols, slot_days = meta.slot_days }
+end
+
+-- Native cursor moves (arrow keys, mouse) bypass move_cursor, leaving
+-- M.cursor stale so actions target the wrong slot. Sync it from the window
+-- position using the last render's slot map; no-op when already in sync
+-- (including our own programmatic cursor placement, so no render loop).
+local function sync_cursor_from_window()
+	if not is_open() or not last_grid or not last_grid.slots then
+		return
+	end
+	if M.view == "month" then
+		return
+	end
+	local ok, pos = pcall(vim.api.nvim_win_get_cursor, win)
+	if not ok then
+		return
+	end
+	local rec = last_grid.slots[pos[1] - 1]
+	if not rec then
+		return
+	end
+	local new_date, new_min = M.cursor.date, rec.s
+	if last_grid.view == "week" and last_grid.day_cols and last_grid.slot_days then
+		for i, range in ipairs(last_grid.day_cols) do
+			if pos[2] >= range.s and pos[2] < range.e then
+				new_date = last_grid.slot_days[i]
+				break
+			end
+		end
+	end
+	local same_date = new_date.year == M.cursor.date.year and new_date.month == M.cursor.date.month and new_date.day == M.cursor.date.day
+	if same_date and new_min == M.cursor.min then
+		return
+	end
+	M.cursor.date = new_date
+	M.cursor.min = new_min
+	M.render()
+end
+
+-- Floating cheatsheet with every calendar keymap, built from the live
+-- config so user overrides always show their real bindings.
+local function show_help()
+	local km = config.options.keymaps.calendar
+	local function key(name)
+		return "`" .. (km[name] or ("<" .. name .. ">")) .. "`"
+	end
+	local rows = {
+		{ key("nav_left") .. " / " .. key("nav_right") .. "  (b / w, ← / →)", "previous / next day" },
+		{ key("nav_up") .. " / " .. key("nav_down") .. "  (↑ / ↓)", "previous / next slot" },
+		{ key("prev_period") .. " / " .. key("next_period"), "previous / next week (month in month view)" },
+		{ key("goto_first_col"), "first column of the row" },
+		{ key("goto_top") .. " / " .. key("goto_bottom"), "first / last slot of the column" },
+		{ key("view_day") .. " / " .. key("view_week") .. " / " .. key("view_month") .. " / " .. key("cycle_view"), "day / week / month view / cycle" },
+		{ key("today"), "go to today" },
+		{ key("add"), "new event on this slot" },
+		{ key("edit"), "event details (picker when overlapping)" },
+		{ key("detail_hsplit") .. " / " .. key("detail_vsplit"), "details in split / vsplit" },
+		{ key("delete"), "delete event under cursor" },
+	}
+	if km.sync and sync_enabled() then
+		table.insert(rows, { key("sync"), "sync now" })
+	end
+	table.insert(rows, { key("filter_calendar"), "calendar filter (all vs single)" })
+	table.insert(rows, { key("help"), "this help" })
+	table.insert(rows, { key("close"), "close calendar" })
+
+	local lines = { "# Bloocky keymaps", "" }
+	local width = 20
+	for _, row in ipairs(rows) do
+		local line = "- " .. row[1] .. "  " .. row[2]
+		table.insert(lines, line)
+		width = math.max(width, utils.dw(line))
+	end
+	width = math.min(width + 2, vim.o.columns - 4)
+
+	local hbuf = vim.api.nvim_create_buf(false, true)
+	vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = hbuf })
+	vim.api.nvim_set_option_value("filetype", "markdown", { buf = hbuf })
+	vim.api.nvim_buf_set_lines(hbuf, 0, -1, false, lines)
+	vim.api.nvim_set_option_value("modifiable", false, { buf = hbuf })
+	vim.api.nvim_set_option_value("modified", false, { buf = hbuf })
+
+	local hwin = vim.api.nvim_open_win(hbuf, true, {
+		relative = "editor",
+		width = width,
+		height = math.min(#lines, math.max(5, vim.o.lines - 6)),
+		row = math.max(0, math.floor((vim.o.lines - #lines) / 2 - 1)),
+		col = math.max(0, math.floor((vim.o.columns - width) / 2)),
+		style = "minimal",
+		border = "rounded",
+		title = " Bloocky keymaps ",
+		title_pos = "center",
+	})
+	local kopts = { buffer = hbuf, noremap = true, silent = true, nowait = true }
+	vim.keymap.set("n", "q", "<cmd>close<cr>", kopts)
+	vim.keymap.set("n", "<Esc>", "<cmd>close<cr>", kopts)
+	pcall(vim.api.nvim_win_set_cursor, hwin, { 1, 0 })
+end
+
+-- First/last visible date in the cursor's weekday column (month view).
+local function month_column_edge(date, first)
+	local one = { year = date.year, month = date.month, day = 1 }
+	local gs = utils.week_start_of(one, config.options.week_start)
+	local last = { year = date.year, month = date.month, day = utils.days_in_month(date.year, date.month) }
+	local span_days = math.floor((utils.date_to_time(last) - utils.date_to_time(gs)) / 86400) + 1
+	local weeks = math.ceil(span_days / 7)
+	local diff = (utils.wday(date) - utils.wday(gs)) % 7
+	if first then
+		return utils.add_days(gs, diff)
+	end
+	return utils.add_days(gs, diff + 7 * (weeks - 1))
 end
 
 -- Cursor movement / period jumps
@@ -657,13 +773,14 @@ local function move_cursor(action)
 		if M.view == "month" then
 			c.date = utils.add_days(c.date, -7)
 		else
-			c.min = c.min - 60
+			-- one grid sub-row in day/week views
+			c.min = c.min - utils.slot_min(config.options.window)
 		end
 	elseif action == "down" then
 		if M.view == "month" then
 			c.date = utils.add_days(c.date, 7)
 		else
-			c.min = c.min + 60
+			c.min = c.min + utils.slot_min(config.options.window)
 		end
 	elseif action == "prev" then
 		if M.view == "month" then
@@ -679,18 +796,37 @@ local function move_cursor(action)
 		end
 	elseif action == "today" then
 		c.date = utils.today()
+	elseif action == "top" then
+		if M.view == "month" then
+			c.date = month_column_edge(c.date, true)
+		else
+			c.min = config.options.hours.start * 60
+		end
+	elseif action == "bottom" then
+		if M.view == "month" then
+			c.date = month_column_edge(c.date, false)
+		else
+			c.min = config.options.hours["end"] * 60 - 15
+		end
+	elseif action == "first_col" then
+		-- Day view has a single column: stay. Week/month jump to the first
+		-- visible day of the current row (week start).
+		if M.view == "week" or M.view == "month" then
+			c.date = utils.week_start_of(c.date, config.options.week_start)
+		end
 	end
 	M.render()
 end
 
--- Blocks under the cursor (whole day in month view, current slot otherwise)
+-- Blocks under the cursor: whole day in month view, the 15-minute sub-row
+-- otherwise, so picking matches exactly what the grid cell shows.
 local function hits_at_cursor()
 	local blocks = state.blocks_for_date(M.cursor.date)
 	if M.view == "month" then
 		return blocks
 	end
 	local s = M.cursor.min
-	local e = s + 60
+	local e = s + 15
 	local out = {}
 	for _, block in ipairs(blocks) do
 		if block.start_min < e and block.start_min + block.duration_min > s then
@@ -836,6 +972,28 @@ local function setup_keymaps()
 	map(km.nav_down, function()
 		move_cursor("down")
 	end)
+	-- `w`/`b` behave like `l`/`h` (next/previous day), matching the arrows
+	-- below: buffer-local, so global mappings are untouched.
+	vim.keymap.set("n", "w", function()
+		move_cursor("right")
+	end, opts)
+	vim.keymap.set("n", "b", function()
+		move_cursor("left")
+	end, opts)
+	-- Arrow keys always work too, so the visual cursor and M.cursor can
+	-- never disagree about which slot actions target.
+	vim.keymap.set("n", "<Up>", function()
+		move_cursor("up")
+	end, opts)
+	vim.keymap.set("n", "<Down>", function()
+		move_cursor("down")
+	end, opts)
+	vim.keymap.set("n", "<Left>", function()
+		move_cursor("left")
+	end, opts)
+	vim.keymap.set("n", "<Right>", function()
+		move_cursor("right")
+	end, opts)
 	map(km.prev_period, function()
 		move_cursor("prev")
 	end)
@@ -844,6 +1002,18 @@ local function setup_keymaps()
 	end)
 	map(km.today, function()
 		move_cursor("today")
+	end)
+	map(km.goto_top or "gg", function()
+		move_cursor("top")
+	end)
+	map(km.goto_bottom or "G", function()
+		move_cursor("bottom")
+	end)
+	map(km.goto_first_col or "0", function()
+		move_cursor("first_col")
+	end)
+	map(km.help or "g?", function()
+		show_help()
 	end)
 	map(km.view_day, function()
 		M.set_view("day")
@@ -1074,6 +1244,16 @@ function M.open(opts)
 			stop_periodic()
 			win = nil
 			buf = nil
+			last_grid = nil
+		end,
+	})
+
+	-- Native moves (arrow keys, mouse) bypass move_cursor: re-derive the
+	-- slot from the window position so actions target the visible cell.
+	vim.api.nvim_create_autocmd("CursorMoved", {
+		buffer = buf,
+		callback = function()
+			sync_cursor_from_window()
 		end,
 	})
 

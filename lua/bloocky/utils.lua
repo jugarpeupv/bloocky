@@ -171,6 +171,15 @@ function M.snap(min, granularity)
 	return math.floor(min / granularity + 0.5) * granularity
 end
 
+-- Week-view grid sub-row size in minutes: 15 or 30 (default 30).
+function M.slot_min(window_cfg)
+	local s = window_cfg and window_cfg.slot_min
+	if s ~= 15 and s ~= 30 then
+		return 30
+	end
+	return s
+end
+
 -- Fit the hours [h0, h1) into `avail` lines so the whole day is always visible.
 -- Roomy: one line per hour plus a divider between them. Tighter: drop the
 -- dividers. Tighter still: group several hours onto one line.

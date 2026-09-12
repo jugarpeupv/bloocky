@@ -12,7 +12,7 @@ M.options = {
 
 	-- Visible hour range in the day and week views
 	hours = {
-		start = 5, -- first hour shown (05:00)
+		start = 6, -- first hour shown (06:00)
 		["end"] = 22, -- last hour shown (22:00)
 	},
 
@@ -45,6 +45,10 @@ M.options = {
 		-- absolute rows if > 1). Anything but "auto" stretches the grid to fill
 		-- the window. A single value applies to every view.
 		height = "auto",
+
+		-- Minutes per week-view grid sub-row: 30 (2 lines per hour) or 15
+		-- (4 lines per hour). Anything else falls back to 30.
+		slot_min = 30,
 
 		border = "rounded",
 
@@ -192,8 +196,11 @@ M.options = {
 			nav_down = "j",
 			nav_up = "k",
 			nav_right = "l",
-			prev_period = "H", -- previous month/week (depends on view)
-			next_period = "L", -- next month/week
+		prev_period = "H", -- previous month/week (depends on view)
+		next_period = "L", -- next month/week
+		goto_top = "gg", -- first slot of the current column
+		goto_bottom = "G", -- last slot of the current column
+		goto_first_col = "0", -- first column of the current row
 			view_day = "gd",
 			view_week = "gw",
 			view_month = "gm",
@@ -206,6 +213,7 @@ M.options = {
 			delete = "x",
 			sync = "s", -- sync now (only bound when sync.enabled)
 			filter_calendar = "f", -- pick calendar filter (all vs single)
+			help = "g?", -- show this keymap cheatsheet
 			close = "q",
 		},
 	},
