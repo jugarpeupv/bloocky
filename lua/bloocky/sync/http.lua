@@ -154,6 +154,9 @@ local function build(opts)
 		"curl",
 		"--silent",
 		"--show-error",
+		-- Pin HTTP/1.1: CalDAV is 1.1-native and quirky gateways (DavMail)
+		-- have shown framing bugs when H2 is negotiated in between.
+		"--http1.1",
 		"--connect-timeout",
 		timeout_s,
 		"--max-time",
@@ -188,6 +191,22 @@ local function build(opts)
 	for name, value in pairs(opts.headers or {}) do
 		table.insert(args, "--header")
 		table.insert(args, name .. ": " .. value)
+	end
+	-- Disable `Expect: 100-continue`: curl adds it to large REPORT/PUT
+	-- bodies and old Java stacks (DavMail) mishandle the handshake, which
+	-- can desync framing and surface as curl 56 chunk errors.
+	do
+		local has_expect = false
+		for name in pairs(opts.headers or {}) do
+			if tostring(name):lower() == "expect" then
+				has_expect = true
+				break
+			end
+		end
+		if not has_expect then
+			table.insert(args, "--header")
+			table.insert(args, "Expect:")
+		end
 	end
 	if opts.body then
 		table.insert(args, "--data-binary")

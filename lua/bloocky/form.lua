@@ -248,14 +248,25 @@ function M.open(opts)
 			return
 		end
 		ui._pick_calendar_for_form(buf, win, function(choice_id)
-			local cur = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+			-- Async callback: the form may have been closed (q) while the
+			-- picker was open. Never throw E21/E5108 into the picker.
+			if not vim.api.nvim_buf_is_valid(buf) then
+				return
+			end
+			local ok_lines, cur = pcall(vim.api.nvim_buf_get_lines, buf, 0, -1, false)
+			if not ok_lines then
+				return
+			end
 			for idx, l in ipairs(cur) do
 				if l:lower():find("calendar") and l:find(":") then
 					local new_line = "- **Calendar:** " .. choice_id
 					pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = buf })
-					vim.api.nvim_buf_set_lines(buf, idx - 1, idx, false, { new_line })
+					local ok_set = pcall(vim.api.nvim_buf_set_lines, buf, idx - 1, idx, false, { new_line })
 					pcall(vim.api.nvim_set_option_value, "modified", true, { buf = buf })
 					pcall(vim.api.nvim_win_set_cursor, win, { idx, 0 })
+					if not ok_set then
+						vim.notify("Bloocky: could not update Calendar line (buffer not modifiable)", vim.log.levels.WARN)
+					end
 					break
 				end
 			end

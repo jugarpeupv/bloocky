@@ -86,16 +86,17 @@ end
 local function resolve_calendars(account, discovered, report)
 	local configured = account.calendars
 	if not configured or #configured == 0 then
-		local out = {}
-		for i, calendar in ipairs(discovered) do
-			table.insert(out, {
-				href = calendar.href,
-				name = calendar.name,
-				mode = calendar.readonly and "ro" or "rw",
-				default = i == 1,
-			})
-		end
-		return out
+	local out = {}
+	for i, calendar in ipairs(discovered) do
+		table.insert(out, {
+			href = calendar.href,
+			name = calendar.name,
+			mode = calendar.readonly and "ro" or "rw",
+			default = i == 1,
+			ctag = calendar.ctag,
+		})
+	end
+	return out
 	end
 
 	local out = {}
@@ -117,12 +118,13 @@ local function resolve_calendars(account, discovered, report)
 			if match.readonly then
 				mode = "ro"
 			end
-			table.insert(out, {
-				href = match.href,
-				name = match.name,
-				mode = mode,
-				default = wanted.default,
-			})
+		table.insert(out, {
+			href = match.href,
+			name = match.name,
+			mode = mode,
+			default = wanted.default,
+			ctag = match.ctag,
+		})
 		else
 			table.insert(report.errors, ("calendar %q not found on the server"):format(wanted.name or wanted.href))
 		end
@@ -467,15 +469,45 @@ local function pull_calendar(account, calendar, report)
 	local provider = providers.for_account(account)
 	local cursor = store.calendar_cursor(account.id, calendar.href)
 	local win = sync_window()
+
+	-- Collection unchanged since the last successful pull: skip the fetch
+	-- entirely. This is what makes repeated :e cheap — discover already gave
+	-- us the fresh ctag, and the push phase above handled local changes, so
+	-- there is nothing a pull could add. No cursor is needed for this: the
+	-- ctag covers adds, edits AND deletes, so an equal ctag means the sweep
+	-- would find nothing either. Servers without ctag (nil/empty) always
+	-- pull, as before.
+	if calendar.ctag and calendar.ctag ~= "" then
+		local last = store.calendar_ctag(account.id, calendar.href)
+		if last ~= nil and last ~= "" and last == calendar.ctag then
+			bump(report.skipped, "unchanged")
+			return
+		end
+	end
+
 	local result, err = provider.fetch(account, calendar, cursor, win)
 
 	if err then
 		local msg = ("%s: %s"):format(calendar.name, err)
 		if tostring(err):find("timed out") then
 			msg = msg .. " (transient stall — next sync retries; tune sync.timeout_s)"
+		elseif tostring(err):find("curl: %(56%)") then
+			msg = msg .. " (transfer framing error from the server — usually transient; next sync retries)"
 		end
 		table.insert(report.errors, msg)
 		return
+	end
+
+	if result.skipped and #result.skipped > 0 then
+		for _, href in ipairs(result.skipped) do
+			table.insert(
+				report.errors,
+				("%s: skipped unreadable event %s (the server cannot serialize it — often an attendee/organizer name with characters the gateway rejects; it will never sync until fixed server-side)"):format(
+					calendar.name,
+					href
+				)
+			)
+		end
 	end
 
 	local seen_hrefs = {}
@@ -502,8 +534,11 @@ local function pull_calendar(account, calendar, report)
 
 	-- For servers without RFC 6578 sync-collection (or during full window fetch):
 	-- any mapped block in this calendar within the sync window that was not returned by the server
-	-- has been deleted on the server.
-	if not cursor or not result.cursor then
+	-- has been deleted on the server. Skipped when some hrefs could not be
+	-- read (broken events): with an incomplete listing the sweep is unsound
+	-- and could delete blocks that still exist remotely. They are caught on a
+	-- later clean sync instead.
+	if (not cursor or not result.cursor) and not (result.skipped and #result.skipped > 0) then
 		local win_start = win.start:sub(1, 8)
 		local win_end = win["end"]:sub(1, 8)
 		local to_delete = {}
@@ -531,6 +566,13 @@ local function pull_calendar(account, calendar, report)
 	-- timeMin it was issued for.
 	if result.cursor then
 		store.set_calendar_cursor(account.id, calendar.href, result.cursor)
+	end
+	-- Remember the collection state just pulled — even with skipped broken
+	-- items (already reported above): re-pulling an unchanged collection
+	-- would only re-isolate the same broken event every sync. A later change
+	-- bumps the ctag and the pull runs again.
+	if calendar.ctag and calendar.ctag ~= "" then
+		store.set_calendar_ctag(account.id, calendar.href, calendar.ctag)
 	end
 	state.save_blocks()
 end

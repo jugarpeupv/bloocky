@@ -705,10 +705,14 @@ local function pick_block(blocks, callback)
 		callback(blocks[1])
 		return
 	end
-	vim.ui.select(blocks, {
+	-- Same picker chain as calendars (snacks → telescope → vim.ui.select),
+	-- so overlapping events never fall back to type-a-number.
+	ui_select(blocks, {
 		prompt = "Which block?",
 		format_item = function(block)
-			return utils.format_hhmm(block.start_min) .. " " .. block.title
+			local badge = M.calendar_badge(block)
+			badge = badge and ("[" .. badge .. "] ") or ""
+			return utils.format_hhmm(block.start_min) .. " " .. badge .. block.title
 		end,
 	}, function(choice)
 		if choice then

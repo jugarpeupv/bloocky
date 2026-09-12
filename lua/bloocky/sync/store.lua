@@ -261,6 +261,23 @@ function M.set_calendar_cursor(account_id, href, token)
 	M.save()
 end
 
+-- Collection tags: the server's own "anything in here changed?" stamp
+-- (cs:getctag). Stored per calendar next to the sync token; a match lets a
+-- pull short-circuit without fetching when the collection is untouched.
+function M.calendar_ctag(account_id, href)
+	local account = M.account(account_id)
+	account.ctags = account.ctags or {}
+	return account.ctags[href]
+end
+
+function M.set_calendar_ctag(account_id, href, ctag)
+	local account = M.account(account_id)
+	account.ctags = account.ctags or {}
+	account.ctags[href] = ctag
+	account.last_sync = os.time()
+	M.save()
+end
+
 -- Reverse lookup: remote identity -> block id. Built on demand rather than
 -- maintained, so it cannot drift out of step with the mappings.
 function M.index_by(field)

@@ -277,13 +277,19 @@ local function call(account, opts)
 	end)
 end
 
-local function dav(account, method, url, body, headers, depth)
+local function dav(account, method, url, body, headers, depth, extra)
 	headers = headers or {}
 	headers["Content-Type"] = body and 'application/xml; charset="utf-8"' or nil
 	if depth then
 		headers.Depth = depth
 	end
-	return call(account, { url = url, method = method, body = body, headers = headers, follow = true })
+	local opts = { url = url, method = method, body = body, headers = headers, follow = true }
+	if extra then
+		for k, v in pairs(extra) do
+			opts[k] = v
+		end
+	end
+	return call(account, opts)
 end
 
 --------------------------------------------------------------------------
@@ -432,7 +438,12 @@ function M.initial_fetch(account, calendar_url, window)
 		"1"
 	)
 	if err then
-		return nil, err
+		-- Transport failure (not an HTTP status): some gateways (DavMail)
+		-- abort a body-carrying REPORT mid-stream when a single event
+		-- contains bytes their iCal parser rejects. Fall back to an
+		-- etag-only enumeration plus isolated multigets so one broken
+		-- event cannot take down the whole calendar.
+		return M.initial_fetch_enum(account, calendar_url, window)
 	end
 	if res.status >= 400 then
 		return nil, ("calendar-query failed (HTTP %d)"):format(res.status)
@@ -441,6 +452,100 @@ function M.initial_fetch(account, calendar_url, window)
 	local parsed = M.parse_multistatus(res.body)
 	local token = M.fetch_sync_token(account, calendar_url)
 	return { changed = parsed.responses, removed = {}, token = token }, nil
+end
+
+-- Initial fetch tolerant of broken events: list member hrefs (no bodies,
+-- so the server never touches its iCal parser), fetch bodies in isolated
+-- chunks, and keep only what overlaps the sync window.
+-- Recurrence-uncertain events (lossy: COUNT/RDATE/overrides) and
+-- cancellations are always kept — dropping them could hide visible
+-- instances or a remote delete.
+function M.initial_fetch_enum(account, calendar_url, window)
+	local err, res = dav(account, "PROPFIND", calendar_url, M.propfind_body({ "d:resourcetype" }), nil, "1")
+	if err then
+		return nil, err
+	end
+	if res.status >= 400 then
+		return nil, ("initial PROPFIND failed (HTTP %d)"):format(res.status)
+	end
+
+	local self_url = tostring(calendar_url):gsub("/+$", "")
+	local hrefs = {}
+	for _, response in ipairs(M.parse_multistatus(res.body).responses) do
+		local href = response.href
+		if href and M.resolve(account.url, href):gsub("/+$", "") ~= self_url then
+			table.insert(hrefs, href)
+		end
+	end
+
+	local changed, skipped = {}, nil
+	if #hrefs > 0 then
+		local data, fetch_err, skipped_hrefs = M.multiget(account, calendar_url, hrefs)
+		if fetch_err then
+			return nil, fetch_err
+		end
+		skipped = skipped_hrefs
+		local win_start = window.start:sub(1, 8)
+		local win_end = window["end"]:sub(1, 8)
+		local mapper = require("bloocky.sync.mapper")
+		for _, response in ipairs(data) do
+			if response.data then
+				local ok, event = pcall(mapper.from_ical, response.data)
+				if ok and event == nil then
+					-- Parsed fine but no VEVENT (e.g. a task): the REPORT
+					-- path never returned these, so skip quietly.
+				elseif ok and event and event.block and not M.in_window(event.block, event, win_start, win_end) then
+					-- Outside the sync window: skip.
+				else
+					-- In window, or unparseable here (apply_remote reports it).
+					table.insert(changed, response)
+				end
+			end
+		end
+	end
+
+	local token = M.fetch_sync_token(account, calendar_url)
+	return { changed = changed, removed = {}, token = token, skipped = skipped }, nil
+end
+
+-- Client-side replacement for the server's time-range filter, used only by
+-- the broken-event fallback. Anything whose placement is uncertain
+-- (cancelled carrying a delete signal, lossy recurrence) is kept.
+function M.in_window(block, event, win_start, win_end)
+	if event.cancelled then
+		return true
+	end
+	if event.lossy then
+		return true
+	end
+	local bdate = (block.date or ""):gsub("-", "")
+	if bdate == "" then
+		return true
+	end
+	-- End date from duration: multi-day events can start before the window
+	-- and still overlap it.
+	local end_date = bdate
+	local y, m, d = (block.date or ""):match("^(%d+)-(%d+)-(%d+)$")
+	if y and (block.duration_min or 0) > 0 then
+		end_date = os.date("%Y%m%d", os.time({ year = tonumber(y), month = tonumber(m), day = tonumber(d), hour = 12 }) + (block.duration_min or 0) * 60)
+	end
+	if end_date < win_start then
+		local r = block.recurrence
+		if r == vim.NIL then
+			r = nil
+		end
+		if not r then
+			return false
+		end
+		if r.until_date and r.until_date ~= "" and r.until_date:gsub("-", "") < win_start then
+			return false
+		end
+		return true
+	end
+	if bdate > win_end then
+		return false
+	end
+	return true
 end
 
 -- A sync-token with no changes attached, so the *next* sync can be
@@ -479,39 +584,99 @@ function M.incremental_fetch(account, calendar_url, token)
 		end
 	end
 
-	local changed = {}
+	local changed, skipped = {}, nil
 	if #changed_hrefs > 0 then
-		local data, fetch_err = M.multiget(account, calendar_url, changed_hrefs)
+		local data, fetch_err, skipped_hrefs = M.multiget(account, calendar_url, changed_hrefs)
 		if fetch_err then
 			return nil, fetch_err
 		end
 		changed = data
+		skipped = skipped_hrefs
 	end
 
-	return { changed = changed, removed = removed, token = parsed.sync_token or token }, nil
+	return { changed = changed, removed = removed, token = parsed.sync_token or token, skipped = skipped }, nil
 end
 
+-- Fetch bodies for hrefs, isolating broken items. Some gateways (DavMail)
+-- abort a whole multiget mid-stream with a malformed chunked body when a
+-- single event contains bytes their iCal parser rejects. On a TRANSPORT
+-- error (curl-level) the slice is bisected until the failing singleton(s)
+-- are isolated; those hrefs are skipped and reported via the third return
+-- value. HTTP statuses keep their current meaning: fatal for the whole
+-- call. Returns (responses, err, skipped_hrefs).
+--
+-- Bisection runs without retries (fast isolation: smaller halves usually
+-- succeed outright, which also heals transient blips). A failing singleton
+-- is confirmed once with normal retries before being declared broken, so a
+-- lone transient failure is recovered, not skipped.
 function M.multiget(account, calendar_url, hrefs)
-	local out = {}
+	local out, skipped = {}, {}
+
+	local function do_slice(slice, extra)
+		local err, res = dav(account, "REPORT", calendar_url, M.multiget_body(slice), nil, "1", extra)
+		if err then
+			return nil, err, true
+		end
+		if res.status >= 400 then
+			return nil, ("calendar-multiget failed (HTTP %d)"):format(res.status), false
+		end
+		local responses = {}
+		for _, response in ipairs(M.parse_multistatus(res.body).responses) do
+			if response.data then
+				table.insert(responses, response)
+			end
+		end
+		return responses, nil, false
+	end
+
+	local function fetch_slice(slice)
+		local responses, err, transport = do_slice(slice, { retries = 0 })
+		if not err then
+			return responses, nil
+		end
+		if not transport then
+			return nil, err
+		end
+		if #slice <= 1 then
+			local cresponses, cerr, ctransport = do_slice(slice, nil)
+			if not cerr then
+				return cresponses, nil
+			end
+			if not ctransport then
+				return nil, cerr
+			end
+			table.insert(skipped, slice[1])
+			return {}, nil
+		end
+		local mid = math.floor(#slice / 2)
+		local left, left_err = fetch_slice(vim.list_slice(slice, 1, mid))
+		if left_err then
+			return nil, left_err
+		end
+		local right, right_err = fetch_slice(vim.list_slice(slice, mid + 1, #slice))
+		if right_err then
+			return nil, right_err
+		end
+		for _, response in ipairs(right) do
+			table.insert(left, response)
+		end
+		return left, nil
+	end
+
 	-- Chunked: a multiget naming several thousand hrefs is a request body some
 	-- servers simply refuse.
 	local CHUNK = 75
 	for start = 1, #hrefs, CHUNK do
 		local slice = vim.list_slice(hrefs, start, math.min(start + CHUNK - 1, #hrefs))
-		local err, res = dav(account, "REPORT", calendar_url, M.multiget_body(slice), nil, "1")
+		local responses, err = fetch_slice(slice)
 		if err then
 			return nil, err
 		end
-		if res.status >= 400 then
-			return nil, ("calendar-multiget failed (HTTP %d)"):format(res.status)
-		end
-		for _, response in ipairs(M.parse_multistatus(res.body).responses) do
-			if response.data then
-				table.insert(out, response)
-			end
+		for _, response in ipairs(responses) do
+			table.insert(out, response)
 		end
 	end
-	return out, nil
+	return out, nil, (#skipped > 0 and skipped or nil)
 end
 
 --------------------------------------------------------------------------
